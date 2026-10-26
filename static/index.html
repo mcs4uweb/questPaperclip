@@ -1,0 +1,271 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Quest Paperclip</title>
+  <style>
+    :root {
+      --bg: #0b1220;
+      --panel: #121a2b;
+      --line: #243049;
+      --text: #e8eefc;
+      --muted: #93a0bb;
+      --accent: #6d7cff;
+      --ok: #34d399;
+      --warn: #fbbf24;
+      --bad: #fb7185;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: Segoe UI, system-ui, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+    }
+    header {
+      display: flex;
+      justify-content: space-between;
+      gap: 16px;
+      align-items: center;
+      padding: 18px 24px;
+      border-bottom: 1px solid var(--line);
+      background: #0e1628;
+    }
+    h1 { margin: 0; font-size: 20px; letter-spacing: .04em; }
+    .sub { color: var(--muted); font-size: 13px; margin-top: 4px; }
+    .metrics { display: flex; gap: 18px; font-size: 13px; }
+    .metrics b { color: white; }
+    nav { display: flex; gap: 8px; padding: 12px 24px; }
+    nav button, button, select, input, textarea {
+      font: inherit;
+      color: var(--text);
+      background: #182238;
+      border: 1px solid var(--line);
+      border-radius: 10px;
+    }
+    nav button { padding: 8px 12px; cursor: pointer; }
+    nav button.active { background: var(--accent); border-color: var(--accent); }
+    main { padding: 0 24px 32px; }
+    .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 14px; }
+    .card, .panel {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 16px;
+      padding: 16px;
+    }
+    .row { display: flex; justify-content: space-between; gap: 8px; align-items: center; }
+    .muted { color: var(--muted); font-size: 12px; }
+    .badge {
+      font-size: 11px;
+      padding: 3px 8px;
+      border-radius: 999px;
+      border: 1px solid var(--line);
+    }
+    .running { color: var(--ok); }
+    .paused, .idle { color: var(--warn); }
+    .exceeded { color: var(--bad); }
+    .bar { height: 8px; background: #0b1220; border-radius: 99px; overflow: hidden; margin-top: 8px; }
+    .bar > div { height: 100%; background: var(--accent); }
+    .bar.hot > div { background: var(--bad); }
+    .kanban { display: grid; grid-template-columns: repeat(5, minmax(170px, 1fr)); gap: 10px; overflow-x: auto; }
+    .col { min-height: 420px; }
+    .ticket { background: #0f1730; border: 1px solid var(--line); border-radius: 12px; padding: 10px; margin-top: 8px; }
+    table { width: 100%; border-collapse: collapse; font-size: 13px; }
+    th, td { text-align: left; padding: 8px; border-bottom: 1px solid var(--line); vertical-align: top; }
+    .actions { display: flex; gap: 6px; }
+    button.small { padding: 6px 8px; cursor: pointer; font-size: 12px; }
+    form { display: grid; gap: 8px; }
+    input, select, textarea { padding: 8px 10px; width: 100%; }
+    .hidden { display: none; }
+    .toast {
+      position: fixed; right: 16px; bottom: 16px;
+      background: #064e3b; border: 1px solid #34d399; padding: 10px 14px;
+      border-radius: 12px;
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <div>
+      <h1>QUEST PAPERCLIP</h1>
+      <div class="sub" id="goal">Local agent control plane</div>
+    </div>
+    <div class="metrics" id="metrics"></div>
+  </header>
+  <nav>
+    <button class="active" data-tab="agents">Agents</button>
+    <button data-tab="tasks">Task board</button>
+    <button data-tab="budget">Budgets</button>
+    <button data-tab="traces">Traces</button>
+  </nav>
+  <main>
+    <section id="agents"></section>
+    <section id="tasks" class="hidden"></section>
+    <section id="budget" class="hidden"></section>
+    <section id="traces" class="hidden"></section>
+  </main>
+  <div id="toast" class="toast hidden"></div>
+  <script>
+    const tabs = document.querySelectorAll("nav button");
+    const sections = {
+      agents: document.getElementById("agents"),
+      tasks: document.getElementById("tasks"),
+      budget: document.getElementById("budget"),
+      traces: document.getElementById("traces"),
+    };
+    tabs.forEach(btn => btn.onclick = () => {
+      tabs.forEach(b => b.classList.toggle("active", b === btn));
+      Object.entries(sections).forEach(([k, el]) => el.classList.toggle("hidden", k !== btn.dataset.tab));
+    });
+
+    function toast(msg) {
+      const el = document.getElementById("toast");
+      el.textContent = msg;
+      el.classList.remove("hidden");
+      setTimeout(() => el.classList.add("hidden"), 2500);
+    }
+
+    async function api(path, opts) {
+      const res = await fetch(path, {
+        headers: { "Content-Type": "application/json" },
+        ...opts,
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data.detail || res.statusText);
+      return data;
+    }
+
+    const columns = ["backlog", "assigned", "in_progress", "review", "completed"];
+    const nextStatus = {
+      backlog: "assigned",
+      assigned: "in_progress",
+      in_progress: "review",
+      review: "completed",
+    };
+
+    async function load() {
+      const [company, agents, tickets, traces] = await Promise.all([
+        api("/api/company"),
+        api("/api/agents"),
+        api("/api/tickets"),
+        api("/api/traces?limit=40"),
+      ]);
+      document.getElementById("goal").textContent = company.goal;
+      document.getElementById("metrics").innerHTML = `
+        <div>Spend <b>$${company.daily_spend.toFixed(2)}</b> / $${company.daily_cap.toFixed(2)}</div>
+        <div>Active <b>${company.active_agents}</b></div>
+        <div>Open tickets <b>${company.open_tickets}</b></div>
+      `;
+
+      sections.agents.innerHTML = `<div class="grid">${agents.map(a => {
+        const pct = a.daily_cap ? Math.min(100, (a.daily_spend / a.daily_cap) * 100) : 0;
+        return `<article class="card">
+          <div class="row">
+            <div><strong>${a.name}</strong><div class="muted">${a.role}</div></div>
+            <span class="badge ${a.status}">${a.status}</span>
+          </div>
+          <p class="muted">${a.provider} · ${a.model}</p>
+          <div class="row muted"><span>Daily budget</span><span>$${a.daily_spend.toFixed(2)} / $${a.daily_cap.toFixed(2)}</span></div>
+          <div class="bar ${pct >= 100 ? "hot" : ""}"><div style="width:${pct}%"></div></div>
+          <div class="actions" style="margin-top:12px">
+            <button class="small" onclick="heartbeat('${a.id}')">Heartbeat</button>
+            <button class="small" onclick="setStatus('${a.id}','${a.status === "paused" ? "running" : "paused"}')">${a.status === "paused" ? "Resume" : "Pause"}</button>
+          </div>
+        </article>`;
+      }).join("")}</div>`;
+
+      sections.tasks.innerHTML = `
+        <div class="panel" style="margin-bottom:14px">
+          <form onsubmit="return createTicket(event)">
+            <div class="row">
+              <input name="title" placeholder="New ticket title" required />
+              <select name="assignee_id">${agents.map(a => `<option value="${a.id}">${a.name}</option>`).join("")}</select>
+              <select name="priority"><option>Medium</option><option>Low</option><option>High</option><option>Critical</option></select>
+              <button class="small">Add ticket</button>
+            </div>
+          </form>
+        </div>
+        <div class="kanban">${columns.map(col => `
+          <div class="panel col">
+            <div class="row"><strong>${col.replace("_", " ")}</strong><span class="muted">${tickets.filter(t => t.status === col).length}</span></div>
+            ${tickets.filter(t => t.status === col).map(t => {
+              const agent = agents.find(a => a.id === t.assignee_id);
+              return `<div class="ticket">
+                <div class="muted">${t.id} · ${t.priority}</div>
+                <strong>${t.title}</strong>
+                <p class="muted">${t.description || ""}</p>
+                <div class="row muted"><span>${agent ? agent.name : t.assignee_id}</span>
+                  ${nextStatus[t.status] ? `<button class="small" onclick="advance('${t.id}','${nextStatus[t.status]}')">Advance</button>` : ""}
+                </div>
+              </div>`;
+            }).join("")}
+          </div>`).join("")}
+        </div>`;
+
+      sections.budget.innerHTML = `<div class="panel"><table>
+        <tr><th>Agent</th><th>Spend</th><th>Cap</th><th></th></tr>
+        ${agents.map(a => `<tr>
+          <td>${a.name}</td>
+          <td>$${a.daily_spend.toFixed(2)}</td>
+          <td><input type="number" step="0.5" value="${a.daily_cap}" id="cap-${a.id}" style="width:90px"></td>
+          <td><button class="small" onclick="saveCap('${a.id}')">Save</button></td>
+        </tr>`).join("")}
+      </table></div>`;
+
+      sections.traces.innerHTML = `<div class="panel"><table>
+        <tr><th>Time</th><th>Agent</th><th>Tool</th><th>Prompt</th><th>Status</th></tr>
+        ${traces.map(t => `<tr>
+          <td class="muted">${new Date(t.timestamp).toLocaleTimeString()}</td>
+          <td>${t.agent_name}</td>
+          <td>${t.tool_called}</td>
+          <td>${t.prompt}</td>
+          <td class="${t.status.includes("Blocked") ? "exceeded" : "running"}">${t.status}</td>
+        </tr>`).join("") || "<tr><td colspan=5 class='muted'>No traces yet. Ping an agent heartbeat.</td></tr>"}
+      </table></div>`;
+    }
+
+    async function heartbeat(id) {
+      try {
+        const result = await api(`/api/agents/${id}/heartbeat`, {
+          method: "POST",
+          body: JSON.stringify({ tokens_consumed: 250, cost_incurred: 0.04, note: "manual dashboard ping" }),
+        });
+        toast(`${id}: ${result.action}`);
+        await load();
+      } catch (err) { toast(err.message); await load(); }
+    }
+    async function setStatus(id, status) {
+      await api(`/api/agents/${id}/status`, { method: "PATCH", body: JSON.stringify({ status }) });
+      await load();
+    }
+    async function saveCap(id) {
+      const daily_cap = Number(document.getElementById(`cap-${id}`).value);
+      await api(`/api/agents/${id}/budget`, { method: "PATCH", body: JSON.stringify({ daily_cap }) });
+      toast("Budget saved");
+      await load();
+    }
+    async function advance(id, status) {
+      await api(`/api/tickets/${id}/status`, { method: "PUT", body: JSON.stringify({ status }) });
+      await load();
+    }
+    async function createTicket(event) {
+      event.preventDefault();
+      const form = new FormData(event.target);
+      await api("/api/tickets", {
+        method: "POST",
+        body: JSON.stringify({
+          title: form.get("title"),
+          assignee_id: form.get("assignee_id"),
+          priority: form.get("priority"),
+        }),
+      });
+      event.target.reset();
+      await load();
+      return false;
+    }
+
+    load().catch(err => toast(err.message));
+  </script>
+</body>
+</html>

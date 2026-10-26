@@ -1,0 +1,9 @@
+{
+  "name": "quest-paperclip-app",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Local Quest Paperclip control plane (FastAPI). Official paperclipai CLI is not required.",
+  "scripts": {
+    "start": "python -m uvicorn main:app --host 127.0.0.1 --port 8000"
+  }
+}
