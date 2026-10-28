@@ -136,13 +136,26 @@
       return data;
     }
 
-    const columns = ["backlog", "assigned", "in_progress", "review", "completed"];
+    const columns = ["todo", "in-progress", "done"];
     const nextStatus = {
-      backlog: "assigned",
-      assigned: "in_progress",
-      in_progress: "review",
-      review: "completed",
+      todo: "in-progress",
+      "in-progress": "done",
+      backlog: "todo",
+      assigned: "in-progress",
+      in_progress: "in-progress",
+      review: "done",
+      completed: null,
     };
+    function esc(value) {
+      return String(value ?? "").replace(/[&<>"']/g, ch => ({
+        "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"
+      }[ch]));
+    }
+    function boardStatus(status) {
+      if (status === "done" || status === "completed") return "done";
+      if (status === "in-progress" || status === "in_progress" || status === "assigned" || status === "review") return "in-progress";
+      return "todo";
+    }
 
     async function load() {
       const [company, agents, tickets, traces] = await Promise.all([
@@ -158,7 +171,26 @@
         <div>Open tickets <b>${company.open_tickets}</b></div>
       `;
 
-      sections.agents.innerHTML = `<div class="grid">${agents.map(a => {
+      sections.agents.innerHTML = `
+        <div class="panel" style="margin-bottom:14px">
+          <form onsubmit="return createAgent(event)">
+            <div class="row">
+              <input name="name" placeholder="Agent name" required />
+              <input name="role" placeholder="Role (what they monitor / do)" required />
+            </div>
+            <div class="row" style="margin-top:8px">
+              <input name="provider" placeholder="Provider (local, web, Bedrock…)" />
+              <input name="model" placeholder="Model" />
+              <input name="daily_cap" type="number" step="0.5" min="0" value="5" style="width:110px" title="Daily cap $" />
+              <select name="reports_to">
+                <option value="">Reports to: none</option>
+                ${agents.map(a => `<option value="${a.id}">${a.name}</option>`).join("")}
+              </select>
+              <button class="small">Add agent</button>
+            </div>
+          </form>
+        </div>
+        <div class="grid">${agents.map(a => {
         const pct = a.daily_cap ? Math.min(100, (a.daily_spend / a.daily_cap) * 100) : 0;
         return `<article class="card">
           <div class="row">
@@ -179,24 +211,50 @@
         <div class="panel" style="margin-bottom:14px">
           <form onsubmit="return createTicket(event)">
             <div class="row">
-              <input name="title" placeholder="New ticket title" required />
-              <select name="assignee_id">${agents.map(a => `<option value="${a.id}">${a.name}</option>`).join("")}</select>
-              <select name="priority"><option>Medium</option><option>Low</option><option>High</option><option>Critical</option></select>
-              <button class="small">Add ticket</button>
+              <input name="story_id" placeholder="US-x.y (optional)" style="max-width:140px" />
+              <input name="title" placeholder="Story title" required />
+              <select name="assignee_id">${agents.map(a => `<option value="${a.id}">${esc(a.name)}</option>`).join("")}</select>
+              <select name="priority"><option>P0</option><option selected>P1</option><option>P2</option><option>P3</option></select>
+              <input name="sprint" placeholder="Sprint" style="max-width:90px" />
+            </div>
+            <input name="epic" placeholder="Epic (e.g. Epic 8 — W-2 upload and extraction)" />
+            <div class="row">
+              <input name="as_a" placeholder="As a …" />
+              <input name="i_want" placeholder="I want …" />
+              <input name="so_that" placeholder="So that …" />
+            </div>
+            <textarea name="must_not" rows="2" placeholder="Must not"></textarea>
+            <textarea name="blocked_by" rows="2" placeholder="Blocked by (wikilinks or story ids)"></textarea>
+            <div class="row">
+              <textarea name="files_existing" rows="2" placeholder="Files — existing"></textarea>
+              <textarea name="files_create" rows="2" placeholder="Files — create"></textarea>
+            </div>
+            <textarea name="acceptance" rows="3" placeholder="Acceptance (one checkbox item per line)"></textarea>
+            <textarea name="test_plan" rows="2" placeholder="Test"></textarea>
+            <div class="row">
+              <input name="pr_size" value="one concern" />
+              <input name="tags" value="user-story" placeholder="tags (comma-separated)" />
+              <button class="small">Add user story</button>
             </div>
           </form>
         </div>
         <div class="kanban">${columns.map(col => `
           <div class="panel col">
-            <div class="row"><strong>${col.replace("_", " ")}</strong><span class="muted">${tickets.filter(t => t.status === col).length}</span></div>
-            ${tickets.filter(t => t.status === col).map(t => {
+            <div class="row"><strong>${col}</strong><span class="muted">${tickets.filter(t => boardStatus(t.status) === col).length}</span></div>
+            ${tickets.filter(t => boardStatus(t.status) === col).map(t => {
               const agent = agents.find(a => a.id === t.assignee_id);
+              const next = nextStatus[t.status] || nextStatus[boardStatus(t.status)];
+              const want = t.i_want || t.description || "";
               return `<div class="ticket">
-                <div class="muted">${t.id} · ${t.priority}</div>
-                <strong>${t.title}</strong>
-                <p class="muted">${t.description || ""}</p>
-                <div class="row muted"><span>${agent ? agent.name : t.assignee_id}</span>
-                  ${nextStatus[t.status] ? `<button class="small" onclick="advance('${t.id}','${nextStatus[t.status]}')">Advance</button>` : ""}
+                <div class="muted">${esc(t.story_id || t.id)} · ${esc(t.priority)}${t.sprint ? " · s" + esc(t.sprint) : ""}</div>
+                <strong>${esc(t.title)}</strong>
+                <p class="muted">${t.as_a ? `As a ${esc(t.as_a)}` : ""}</p>
+                <p class="muted">${esc(want)}</p>
+                <p class="muted">${t.epic ? esc(t.epic) : ""}</p>
+                ${t.must_not ? `<p class="muted">Must not: ${esc(t.must_not)}</p>` : ""}
+                ${t.blocked_by ? `<p class="muted">Blocked by: ${esc(t.blocked_by)}</p>` : ""}
+                <div class="row muted"><span>${esc(agent ? agent.name : t.assignee_id)}</span>
+                  ${next ? `<button class="small" onclick="advance('${t.id}','${next}')">Advance</button>` : ""}
                 </div>
               </div>`;
             }).join("")}
@@ -249,19 +307,66 @@
       await api(`/api/tickets/${id}/status`, { method: "PUT", body: JSON.stringify({ status }) });
       await load();
     }
+    async function createAgent(event) {
+      event.preventDefault();
+      const form = new FormData(event.target);
+      const reports_to = form.get("reports_to") || null;
+      try {
+        const agent = await api("/api/agents", {
+          method: "POST",
+          body: JSON.stringify({
+            name: form.get("name"),
+            role: form.get("role"),
+            provider: form.get("provider") || "local",
+            model: form.get("model") || "unassigned",
+            daily_cap: Number(form.get("daily_cap") || 5),
+            reports_to,
+            status: "idle",
+          }),
+        });
+        event.target.reset();
+        toast(`Added ${agent.name}`);
+        await load();
+      } catch (err) { toast(err.message); }
+      return false;
+    }
     async function createTicket(event) {
       event.preventDefault();
       const form = new FormData(event.target);
-      await api("/api/tickets", {
-        method: "POST",
-        body: JSON.stringify({
-          title: form.get("title"),
-          assignee_id: form.get("assignee_id"),
-          priority: form.get("priority"),
-        }),
-      });
-      event.target.reset();
-      await load();
+      const as_a = form.get("as_a") || "";
+      const i_want = form.get("i_want") || "";
+      const so_that = form.get("so_that") || "";
+      const description = [as_a && `As a ${as_a}`, i_want && `I want ${i_want}`, so_that && `So that ${so_that}`]
+        .filter(Boolean).join(". ");
+      try {
+        await api("/api/tickets", {
+          method: "POST",
+          body: JSON.stringify({
+            title: form.get("title"),
+            description,
+            assignee_id: form.get("assignee_id"),
+            priority: form.get("priority"),
+            status: "todo",
+            story_id: form.get("story_id") || null,
+            epic: form.get("epic") || "",
+            sprint: form.get("sprint") || "",
+            as_a,
+            i_want,
+            so_that,
+            blocked_by: form.get("blocked_by") || "",
+            must_not: form.get("must_not") || "",
+            files_existing: form.get("files_existing") || "",
+            files_create: form.get("files_create") || "",
+            acceptance: form.get("acceptance") || "",
+            test_plan: form.get("test_plan") || "",
+            pr_size: form.get("pr_size") || "one concern",
+            tags: form.get("tags") || "user-story",
+          }),
+        });
+        event.target.reset();
+        toast("User story added");
+        await load();
+      } catch (err) { toast(err.message); }
       return false;
     }
 
