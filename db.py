@@ -2,25 +2,53 @@
 
 from __future__ import annotations
 
+import os
 import sqlite3
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterator, Optional
+from zoneinfo import ZoneInfo
 
 ROOT = Path(__file__).resolve().parent
 DATA_DIR = ROOT / "data"
+def _db_path() -> Path:
+    override = os.environ.get("PAPERCLIP_DB")
+    if override:
+        return Path(override)
+    return DATA_DIR / "paperclip.db"
+
+
+# Kept for callers that read db.DB_PATH; re-evaluated via get_db_path().
 DB_PATH = DATA_DIR / "paperclip.db"
+CHICAGO = ZoneInfo("America/Chicago")
+DEFAULT_MONTHLY_CAP = 150.0
 
 
 def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def chicago_now() -> datetime:
+    return datetime.now(CHICAGO)
+
+
+def chicago_today() -> str:
+    return chicago_now().date().isoformat()
+
+
+def get_db_path() -> Path:
+    override = os.environ.get("PAPERCLIP_DB")
+    if override:
+        return Path(override)
+    return DATA_DIR / "paperclip.db"
+
+
 @contextmanager
 def get_conn() -> Iterator[sqlite3.Connection]:
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(DB_PATH)
+    path = get_db_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(path)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
     try:
@@ -73,6 +101,7 @@ def init_db() -> None:
               token_count INTEGER NOT NULL DEFAULT 0,
               status TEXT NOT NULL DEFAULT 'Success',
               timestamp TEXT NOT NULL,
+              job_id TEXT,
               FOREIGN KEY (agent_id) REFERENCES agents(id)
             );
 
@@ -84,6 +113,8 @@ def init_db() -> None:
         )
         _migrate_ticket_story_columns(conn)
         _migrate_agent_hermes_columns(conn)
+        _migrate_agent_usage_columns(conn)
+        _migrate_jobs_table(conn)
         _seed_if_empty(conn)
 
 
@@ -96,10 +127,57 @@ def _migrate_agent_hermes_columns(conn: sqlite3.Connection) -> None:
         "total_tokens": "INTEGER NOT NULL DEFAULT 0",
         "last_run_summary": "TEXT NOT NULL DEFAULT ''",
         "avatar_color": "TEXT NOT NULL DEFAULT 'bg-indigo-500'",
+        "spend_date": "TEXT",
+        "monthly_spend": "REAL NOT NULL DEFAULT 0",
+        "monthly_cap": "REAL",
+        "usage_source": "TEXT NOT NULL DEFAULT 'unknown'",
     }
     for name, decl in additions.items():
         if name not in existing:
             conn.execute(f"ALTER TABLE agents ADD COLUMN {name} {decl}")
+
+
+def _migrate_agent_usage_columns(conn: sqlite3.Connection) -> None:
+    existing = {row["name"] for row in conn.execute("PRAGMA table_info(agents)").fetchall()}
+    additions = {
+        "spend_date": "TEXT",
+        "monthly_spend": "REAL NOT NULL DEFAULT 0",
+        "monthly_cap": "REAL",
+        "usage_source": "TEXT NOT NULL DEFAULT 'unknown'",
+    }
+    for name, decl in additions.items():
+        if name not in existing:
+            conn.execute(f"ALTER TABLE agents ADD COLUMN {name} {decl}")
+
+
+def _migrate_jobs_table(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS jobs (
+          id TEXT PRIMARY KEY,
+          agent_id TEXT NOT NULL,
+          ticket_id TEXT,
+          kind TEXT NOT NULL DEFAULT '',
+          goal TEXT NOT NULL DEFAULT '',
+          cwd TEXT NOT NULL DEFAULT '',
+          status TEXT NOT NULL DEFAULT 'queued',
+          stdout TEXT NOT NULL DEFAULT '',
+          stderr TEXT NOT NULL DEFAULT '',
+          error TEXT,
+          tokens INTEGER,
+          cost REAL,
+          latency_ms INTEGER NOT NULL DEFAULT 0,
+          usage_source TEXT NOT NULL DEFAULT 'unknown',
+          created_at TEXT NOT NULL,
+          started_at TEXT,
+          finished_at TEXT,
+          FOREIGN KEY (agent_id) REFERENCES agents(id)
+        )
+        """
+    )
+    existing = {row["name"] for row in conn.execute("PRAGMA table_info(jobs)").fetchall()}
+    if "usage_source" not in existing:
+        conn.execute("ALTER TABLE jobs ADD COLUMN usage_source TEXT NOT NULL DEFAULT 'unknown'")
 
 
 def _migrate_ticket_story_columns(conn: sqlite3.Connection) -> None:
@@ -126,103 +204,8 @@ def _migrate_ticket_story_columns(conn: sqlite3.Connection) -> None:
 
 
 def _seed_if_empty(conn: sqlite3.Connection) -> None:
-    count = conn.execute("SELECT COUNT(*) AS n FROM agents").fetchone()["n"]
-    if count:
-        return
-
-    agents = [
-        (
-            "quest",
-            "Quest",
-            "Lead orchestrator",
-            "OpenClaw / Bedrock",
-            "bedrock/grok-4-6",
-            "running",
-            0.24,
-            15.0,
-            None,
-            None,
-        ),
-        (
-            "video",
-            "Video Pipeline",
-            "Math / YouTube render queue",
-            "local",
-            "video-use + Coqui",
-            "idle",
-            0.0,
-            5.0,
-            None,
-            "quest",
-        ),
-        (
-            "market",
-            "Market Watch",
-            "Morning stock health check",
-            "web",
-            "research",
-            "idle",
-            0.0,
-            3.0,
-            None,
-            "quest",
-        ),
-    ]
-    conn.executemany(
-        """
-        INSERT INTO agents (
-          id, name, role, provider, model, status,
-          daily_spend, daily_cap, last_heartbeat, reports_to
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """,
-        agents,
-    )
-
-    created = now_iso()
-    tickets = [
-        (
-            "TCK-101",
-            "Process leftover video-use inputs",
-            "option-trading.txt is still unprocessed in video-use-Coqui\\inputs.",
-            "video",
-            "High",
-            "backlog",
-            0,
-            created,
-        ),
-        (
-            "TCK-102",
-            "Morning stock health check",
-            "JEPI, SPYI, JEPQ, QQQI, VIG, SCHD snapshot in Central Time.",
-            "market",
-            "Medium",
-            "assigned",
-            0,
-            created,
-        ),
-        (
-            "TCK-103",
-            "Keep Telegram heartbeats off",
-            "Heartbeat target stays none. Real DMs to 8856935268 still allowed.",
-            "quest",
-            "Low",
-            "completed",
-            0,
-            created,
-        ),
-    ]
-    conn.executemany(
-        """
-        INSERT INTO tickets (
-          id, title, description, assignee_id, priority, status, tokens_used, created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-        """,
-        tickets,
-    )
-    conn.execute(
-        "INSERT OR REPLACE INTO meta (key, value) VALUES ('next_ticket', ?)",
-        ("104",),
-    )
+    """Do not insert demo Quest / Video / Market agents."""
+    return
 
 
 def row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
@@ -239,6 +222,26 @@ def get_agent(agent_id: str) -> Optional[dict[str, Any]]:
     with get_conn() as conn:
         row = conn.execute("SELECT * FROM agents WHERE id = ?", (agent_id,)).fetchone()
     return row_to_dict(row) if row else None
+
+
+def delete_agent(agent_id: str) -> bool:
+    with get_conn() as conn:
+        if not conn.execute("SELECT 1 FROM agents WHERE id = ?", (agent_id,)).fetchone():
+            return False
+        fallback = conn.execute(
+            "SELECT id FROM agents WHERE id != ? ORDER BY name LIMIT 1",
+            (agent_id,),
+        ).fetchone()
+        conn.execute("DELETE FROM traces WHERE agent_id = ?", (agent_id,))
+        if fallback:
+            conn.execute(
+                "UPDATE tickets SET assignee_id = ? WHERE assignee_id = ?",
+                (fallback["id"], agent_id),
+            )
+        else:
+            conn.execute("DELETE FROM tickets WHERE assignee_id = ?", (agent_id,))
+        conn.execute("DELETE FROM agents WHERE id = ?", (agent_id,))
+    return True
 
 
 def slugify_agent_id(name: str) -> str:
@@ -421,6 +424,76 @@ def delete_ticket(ticket_id: str) -> bool:
     return cur.rowcount > 0
 
 
+def create_job(
+    *,
+    job_id: str,
+    agent_id: str,
+    kind: str,
+    goal: str,
+    cwd: str = "",
+    ticket_id: Optional[str] = None,
+    status: str = "running",
+) -> dict[str, Any]:
+    created = now_iso()
+    with get_conn() as conn:
+        conn.execute(
+            """
+            INSERT INTO jobs (
+              id, agent_id, ticket_id, kind, goal, cwd, status,
+              stdout, stderr, error, tokens, cost, latency_ms, usage_source,
+              created_at, started_at, finished_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, '', '', NULL, NULL, NULL, 0, 'unknown', ?, ?, NULL)
+            """,
+            (job_id, agent_id, ticket_id, kind, goal, cwd or "", status, created, created),
+        )
+        row = conn.execute("SELECT * FROM jobs WHERE id = ?", (job_id,)).fetchone()
+    return row_to_dict(row)
+
+
+def finish_job(
+    job_id: str,
+    *,
+    status: str,
+    stdout: str = "",
+    stderr: str = "",
+    error: Optional[str] = None,
+    tokens: int = 0,
+    cost: float = 0.0,
+    latency_ms: int = 0,
+    usage_source: str = "unknown",
+) -> Optional[dict[str, Any]]:
+    with get_conn() as conn:
+        conn.execute(
+            """
+            UPDATE jobs SET
+              status = ?, stdout = ?, stderr = ?, error = ?,
+              tokens = ?, cost = ?, latency_ms = ?, usage_source = ?,
+              finished_at = ?
+            WHERE id = ?
+            """,
+            (
+                status,
+                stdout or "",
+                stderr or "",
+                error,
+                tokens,
+                cost,
+                latency_ms,
+                usage_source,
+                now_iso(),
+                job_id,
+            ),
+        )
+        row = conn.execute("SELECT * FROM jobs WHERE id = ?", (job_id,)).fetchone()
+    return row_to_dict(row) if row else None
+
+
+def get_job(job_id: str) -> Optional[dict[str, Any]]:
+    with get_conn() as conn:
+        row = conn.execute("SELECT * FROM jobs WHERE id = ?", (job_id,)).fetchone()
+    return row_to_dict(row) if row else None
+
+
 def add_trace(
     *,
     trace_id: str,
@@ -433,6 +506,7 @@ def add_trace(
     token_count: int = 0,
     status: str = "Success",
     timestamp: Optional[str] = None,
+    job_id: Optional[str] = None,
 ) -> dict[str, Any]:
     ts = timestamp or now_iso()
     with get_conn() as conn:
@@ -440,8 +514,8 @@ def add_trace(
             """
             INSERT INTO traces (
               id, agent_id, agent_name, tool_called, prompt, response,
-              latency_ms, token_count, status, timestamp
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+              latency_ms, token_count, status, timestamp, job_id
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 trace_id,
@@ -454,6 +528,7 @@ def add_trace(
                 token_count,
                 status,
                 ts,
+                job_id,
             ),
         )
         conn.execute(
@@ -474,3 +549,147 @@ def list_traces(limit: int = 50) -> list[dict[str, Any]]:
             (limit,),
         ).fetchall()
     return [row_to_dict(r) for r in rows]
+
+
+def reset_daily_spend_if_needed(agent_id: str, today: Optional[str] = None) -> Optional[dict[str, Any]]:
+    today = today or chicago_today()
+    agent = get_agent(agent_id)
+    if not agent:
+        return None
+    spend_date = agent.get("spend_date")
+    if spend_date == today:
+        return agent
+    fields: dict[str, Any] = {"spend_date": today, "daily_spend": 0}
+    if agent.get("status") == "exceeded":
+        fields["status"] = "idle"
+    return update_agent(agent_id, **fields)
+
+
+def reset_all_daily_spend_if_needed(today: Optional[str] = None) -> None:
+    today = today or chicago_today()
+    for agent in list_agents():
+        reset_daily_spend_if_needed(agent["id"], today=today)
+
+
+def get_meta(key: str, default: Optional[str] = None) -> Optional[str]:
+    with get_conn() as conn:
+        row = conn.execute("SELECT value FROM meta WHERE key = ?", (key,)).fetchone()
+    if not row:
+        return default
+    return row["value"]
+
+
+def set_meta(key: str, value: str) -> None:
+    with get_conn() as conn:
+        conn.execute(
+            "INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)",
+            (key, value),
+        )
+
+
+def get_company_monthly_cap() -> float:
+    raw = get_meta("monthly_cap")
+    if raw is None or raw == "":
+        return DEFAULT_MONTHLY_CAP
+    try:
+        return float(raw)
+    except ValueError:
+        return DEFAULT_MONTHLY_CAP
+
+
+def set_company_monthly_cap(value: float) -> float:
+    cap = max(0.0, float(value))
+    set_meta("monthly_cap", str(cap))
+    return cap
+
+
+def create_job(
+    *,
+    job_id: str,
+    agent_id: str,
+    kind: str,
+    goal: str,
+    cwd: str = "",
+    ticket_id: Optional[str] = None,
+) -> dict[str, Any]:
+    created = now_iso()
+    with get_conn() as conn:
+        conn.execute(
+            """
+            INSERT INTO jobs (
+              id, agent_id, ticket_id, kind, goal, cwd, status,
+              created_at, usage_source
+            ) VALUES (?, ?, ?, ?, ?, ?, 'queued', ?, 'unknown')
+            """,
+            (job_id, agent_id, ticket_id, kind, goal, cwd or "", created),
+        )
+        row = conn.execute("SELECT * FROM jobs WHERE id = ?", (job_id,)).fetchone()
+    return row_to_dict(row)
+
+
+def get_job(job_id: str) -> Optional[dict[str, Any]]:
+    with get_conn() as conn:
+        row = conn.execute("SELECT * FROM jobs WHERE id = ?", (job_id,)).fetchone()
+    return row_to_dict(row) if row else None
+
+
+def list_jobs(agent_id: Optional[str] = None) -> list[dict[str, Any]]:
+    with get_conn() as conn:
+        if agent_id:
+            rows = conn.execute(
+                "SELECT * FROM jobs WHERE agent_id = ? ORDER BY created_at DESC",
+                (agent_id,),
+            ).fetchall()
+        else:
+            rows = conn.execute("SELECT * FROM jobs ORDER BY created_at DESC").fetchall()
+    return [row_to_dict(r) for r in rows]
+
+
+def list_open_jobs(agent_id: str) -> list[dict[str, Any]]:
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT * FROM jobs WHERE agent_id = ? AND status IN ('queued', 'running') ORDER BY created_at",
+            (agent_id,),
+        ).fetchall()
+    return [row_to_dict(r) for r in rows]
+
+
+def get_running_job(agent_id: str) -> Optional[dict[str, Any]]:
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT * FROM jobs WHERE agent_id = ? AND status = 'running' LIMIT 1",
+            (agent_id,),
+        ).fetchone()
+    return row_to_dict(row) if row else None
+
+
+def update_job(job_id: str, **fields: Any) -> Optional[dict[str, Any]]:
+    if not fields:
+        return get_job(job_id)
+    assignments = ", ".join(f"{key} = ?" for key in fields)
+    values = list(fields.values()) + [job_id]
+    with get_conn() as conn:
+        conn.execute(f"UPDATE jobs SET {assignments} WHERE id = ?", values)
+        row = conn.execute("SELECT * FROM jobs WHERE id = ?", (job_id,)).fetchone()
+    return row_to_dict(row) if row else None
+
+
+def claim_next_job() -> Optional[dict[str, Any]]:
+    with get_conn() as conn:
+        row = conn.execute(
+            """
+            SELECT * FROM jobs
+            WHERE status = 'queued'
+              AND agent_id NOT IN (SELECT agent_id FROM jobs WHERE status = 'running')
+            ORDER BY created_at
+            LIMIT 1
+            """
+        ).fetchone()
+        if not row:
+            return None
+        conn.execute(
+            "UPDATE jobs SET status = 'running', started_at = ? WHERE id = ?",
+            (now_iso(), row["id"]),
+        )
+        claimed = conn.execute("SELECT * FROM jobs WHERE id = ?", (row["id"],)).fetchone()
+    return row_to_dict(claimed) if claimed else None

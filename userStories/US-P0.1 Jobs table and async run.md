@@ -3,7 +3,7 @@ id: US-P0.1
 epic: Epic 0 — Stop treating a run as a request
 priority: P0
 sprint: 1
-status: todo
+status: review
 blocked_by: []
 tags:
   - user-story
@@ -28,12 +28,12 @@ tags:
 - Create: `jobs.py` (or a jobs section in `db.py`) if that keeps `main.py` smaller
 
 ## Acceptance
-- [ ] A `jobs` table exists: `id`, `agent_id`, `ticket_id` (nullable), `kind`, `goal`, `cwd`, `status` (`queued` / `running` / `succeeded` / `failed` / `cancelled`), `stdout`, `stderr`, `error`, `tokens`, `cost`, `latency_ms`, `created_at`, `started_at`, `finished_at`.
-- [ ] `POST /api/agents/{id}/run` (and the existing kind-specific `/run` URLs) return **202** with `{ job_id, status: "queued" }` and do not wait for the CLI.
-- [ ] A worker (BackgroundTasks or a small process loop) executes one job per agent at a time.
-- [ ] `GET /api/jobs/{id}` and `GET /api/agents/{id}` show live job status. Agent `status` is `running` only while a job is `running`.
-- [ ] Empty goal still returns 400 before a job is created.
-- [ ] Paused / over-cap agents still return 403 and do not enqueue.
+- [x] A `jobs` table exists: `id`, `agent_id`, `ticket_id` (nullable), `kind`, `goal`, `cwd`, `status` (`queued` / `running` / `succeeded` / `failed` / `cancelled`), `stdout`, `stderr`, `error`, `tokens`, `cost`, `latency_ms`, `created_at`, `started_at`, `finished_at`.
+- [x] `POST /api/agents/{id}/run` (and the existing kind-specific `/run` URLs) return **202** with `{ job_id, status: "queued" }` and do not wait for the CLI.
+- [x] A worker (BackgroundTasks or a small process loop) executes one job per agent at a time.
+- [x] `GET /api/jobs/{id}` and `GET /api/agents/{id}` show live job status. Agent `status` is `running` only while a job is `running`.
+- [x] Empty goal still returns 400 before a job is created.
+- [x] Paused / over-cap agents still return 403 and do not enqueue.
 
 ## Test
 - POST run without a goal → 400, no job row.

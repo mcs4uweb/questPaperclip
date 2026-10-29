@@ -3,7 +3,7 @@ id: US-P0.4
 epic: Epic 0 — Stop treating a run as a request
 priority: P0
 sprint: 2
-status: todo
+status: review
 blocked_by:
   - "[[US-P0.3 Shared runner contract]]"
 tags:
@@ -29,12 +29,12 @@ tags:
 - Create: a small `usage.py` parser if that keeps runners thin
 
 ## Acceptance
-- [ ] Hermes usage is parsed from the session footer / provider usage when present. If missing, store `tokens=null` (or 0 with `usage_source=unknown`) — do not count words.
-- [ ] OpenClaw / Nanoclaw persist provider usage when the payload has it; otherwise `unknown`, not a word count.
-- [ ] Heartbeat does not invent 250 tokens / $0.04. If it only pings liveness, cost is 0.
-- [ ] `daily_spend` resets at local midnight **America/Chicago**.
-- [ ] Monthly cap is a stored number (company or per-agent), not `daily * 12.4`.
-- [ ] Budget UI shows source: parsed vs unknown.
+- [x] Hermes usage is parsed from the session footer / provider usage when present. If missing, store `tokens=null` (or 0 with `usage_source=unknown`) — do not count words.
+- [x] OpenClaw / Nanoclaw persist provider usage when the payload has it; otherwise `unknown`, not a word count.
+- [x] Heartbeat does not invent 250 tokens / $0.04. If it only pings liveness, cost is 0.
+- [x] `daily_spend` resets at local midnight **America/Chicago**.
+- [x] Monthly cap is a stored number (company or per-agent), not `daily * 12.4`.
+- [x] Budget UI shows source: parsed vs unknown.
 
 ## Test
 - Parser unit tests: a sample Hermes footer → expected tokens/cost; footer-less stdout → unknown, not `len(words)`.

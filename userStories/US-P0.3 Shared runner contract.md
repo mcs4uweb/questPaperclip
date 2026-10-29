@@ -3,7 +3,7 @@ id: US-P0.3
 epic: Epic 0 — Stop treating a run as a request
 priority: P0
 sprint: 1
-status: todo
+status: review
 blocked_by:
   - "[[US-P0.1 Jobs table and async run]]"
 tags:
@@ -29,11 +29,11 @@ tags:
 - Create: `runner.py` (or similar) with `run_agent(agent, goal, cwd) -> Result`
 
 ## Acceptance
-- [ ] One `Result` type: `ok`, `stdout`, `stderr`, `error`, `tokens`, `cost`, `latency_ms`, `model`.
-- [ ] Cap / pause / goal / trace / spend updates live in one function used by all three kinds.
-- [ ] Kind-specific `/hermes/run`, `/openclaw/run`, `/nanoclaw/run` become thin aliases of `POST /api/agents/{id}/run`.
-- [ ] OpenClaw pins **one** request payload and fails with the HTTP status + first 500 chars of body if it does not match.
-- [ ] Seed display-only agents (Quest, Video Pipeline, Market Watch) are not silently routed through a real CLI unless `kind` is `hermes` / `openclaw` / `nanoclaw`.
+- [x] One `Result` type: `ok`, `stdout`, `stderr`, `error`, `tokens`, `cost`, `latency_ms`, `model`.
+- [x] Cap / pause / goal / trace / spend updates live in one function used by all three kinds.
+- [x] Kind-specific `/hermes/run`, `/openclaw/run`, `/nanoclaw/run` become thin aliases of `POST /api/agents/{id}/run`.
+- [x] OpenClaw pins **one** request payload and fails with the HTTP status + first 500 chars of body if it does not match.
+- [x] Seed display-only agents (Quest, Video Pipeline, Market Watch) are not silently routed through a real CLI unless `kind` is `hermes` / `openclaw` / `nanoclaw`.
 
 ## Test
 - Unit-test the shared Result mapping with a fake runner (ok / fail / empty stdout).

@@ -9,6 +9,7 @@ from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 
 import db
+import jobs
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 
@@ -44,6 +45,10 @@ class Agent(BaseModel):
     total_tokens: int = 0
     last_run_summary: str = ""
     avatar_color: str = "bg-indigo-500"
+    monthly_spend: float = 0.0
+    monthly_cap: Optional[float] = None
+    usage_source: str = "unknown"
+    spend_date: Optional[str] = None
 
 
 TICKET_STATUSES = Literal["todo", "in-progress", "done", "backlog", "assigned", "review", "completed"]
@@ -86,6 +91,12 @@ class TraceLog(BaseModel):
     token_count: int = 0
     status: str = "Success"
     timestamp: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    job_id: Optional[str] = None
+    job_stdout: str = ""
+    job_stderr: str = ""
+    job_error: Optional[str] = None
+    job_status: Optional[str] = None
+    job_finished_at: Optional[str] = None
 
 
 class HeartbeatIn(BaseModel):
@@ -93,6 +104,19 @@ class HeartbeatIn(BaseModel):
     cost_incurred: float = 0.0
     current_task_id: Optional[str] = None
     note: str = ""
+    ping_only: bool = True
+
+
+class CompanyBudgetIn(BaseModel):
+    monthly_cap: float
+
+
+class AgentRunIn(BaseModel):
+    goal: Optional[str] = None
+    working_dir: Optional[str] = None
+    timeout_sec: Optional[int] = Field(default=None, ge=1, le=86400)
+    ticket_id: Optional[str] = None
+    url: Optional[str] = None
 
 
 class TicketCreate(BaseModel):
@@ -189,6 +213,10 @@ def agent_from_row(row: dict) -> Agent:
         total_tokens=row.get("total_tokens") or 0,
         last_run_summary=row.get("last_run_summary") or "",
         avatar_color=row.get("avatar_color") or "bg-indigo-500",
+        monthly_spend=row.get("monthly_spend") or 0.0,
+        monthly_cap=row.get("monthly_cap"),
+        usage_source=row.get("usage_source") or "unknown",
+        spend_date=row.get("spend_date"),
     )
 
 
@@ -231,6 +259,12 @@ def trace_from_row(row: dict) -> TraceLog:
         token_count=row["token_count"],
         status=row["status"],
         timestamp=parse_dt(row["timestamp"]) or datetime.now(timezone.utc),
+        job_id=row.get("job_id"),
+        job_stdout=row.get("job_stdout") or "",
+        job_stderr=row.get("job_stderr") or "",
+        job_error=row.get("job_error"),
+        job_status=row.get("job_status"),
+        job_finished_at=row.get("job_finished_at"),
     )
 
 
@@ -242,6 +276,7 @@ def record_trace(**kwargs) -> TraceLog:
 @app.on_event("startup")
 def startup() -> None:
     db.init_db()
+    jobs.start_worker()
 
 
 @app.get("/health")
@@ -262,23 +297,57 @@ def health():
 
 @app.get("/api/company")
 def company():
+    db.reset_all_daily_spend_if_needed()
     agents = db.list_agents()
     tickets = db.list_tickets()
-    spend = round(sum(a["daily_spend"] for a in agents), 4)
-    cap = round(sum(a["daily_cap"] for a in agents), 2)
+    spend = round(sum(float(a.get("daily_spend") or 0) for a in agents), 4)
+    cap = round(sum(float(a.get("daily_cap") or 0) for a in agents), 2)
+    monthly_spend = round(sum(float(a.get("monthly_spend") or 0) for a in agents), 4)
+    monthly_cap = db.get_company_monthly_cap()
+    sources = {a.get("usage_source") or "unknown" for a in agents}
+    usage_source = "parsed" if sources == {"parsed"} else ("mixed" if "parsed" in sources else "unknown")
     return {
         "name": "Quest Studio",
         "goal": "Ship math-learning videos and keep investing / home-energy work organized without extra Telegram noise.",
         "daily_spend": spend,
         "daily_cap": cap,
+        "monthly_spend": monthly_spend,
+        "monthly_cap": monthly_cap,
+        "usage_source": usage_source,
         "active_agents": sum(1 for a in agents if a["status"] == "running"),
         "open_tickets": sum(1 for t in tickets if t["status"] not in ("completed", "done")),
     }
 
 
+@app.patch("/api/company")
+def update_company(body: CompanyBudgetIn):
+    monthly_cap = db.set_company_monthly_cap(body.monthly_cap)
+    payload = company()
+    payload["monthly_cap"] = monthly_cap
+    return payload
+
+
 @app.get("/api/agents", response_model=List[Agent])
 def list_agents():
+    db.reset_all_daily_spend_if_needed()
     return [agent_from_row(row) for row in db.list_agents()]
+
+
+@app.get("/api/agents/{agent_id}", response_model=Agent)
+def get_agent(agent_id: str):
+    db.reset_daily_spend_if_needed(agent_id)
+    row = db.get_agent(agent_id)
+    if not row:
+        raise HTTPException(404, "Agent not found")
+    return agent_from_row(row)
+
+
+@app.delete("/api/agents/{agent_id}")
+def delete_agent(agent_id: str):
+    if not db.get_agent(agent_id):
+        raise HTTPException(404, "Agent not found")
+    db.delete_agent(agent_id)
+    return {"ok": True, "deleted": agent_id}
 
 
 @app.post("/api/agents", response_model=Agent)
@@ -340,16 +409,21 @@ def heartbeat(agent_id: str, body: HeartbeatIn):
     if agent["status"] == "paused":
         raise HTTPException(403, "Agent is paused")
 
-    next_spend = round(agent["daily_spend"] + body.cost_incurred, 4)
-    if next_spend > agent["daily_cap"]:
-        db.update_agent(agent_id, status="exceeded")
+    db.reset_daily_spend_if_needed(agent_id)
+    agent = db.get_agent(agent_id) or agent
+    ping_only = body.ping_only or (not body.tokens_consumed and not body.cost_incurred)
+    tokens = 0 if ping_only else max(0, int(body.tokens_consumed or 0))
+    cost = 0.0 if ping_only else max(0.0, float(body.cost_incurred or 0))
+    next_spend = round(float(agent["daily_spend"]) + cost, 4)
+    if agent["daily_cap"] and next_spend > float(agent["daily_cap"]) and float(agent["daily_cap"]) > 0:
+        db.update_agent(agent_id, status="exceeded", last_heartbeat=db.now_iso())
         record_trace(
             agent_id=agent["id"],
             agent_name=agent["name"],
             tool_called="heartbeat",
             prompt=body.note or "heartbeat",
             response=f"HALT: cap ${agent['daily_cap']:.2f}",
-            token_count=body.tokens_consumed,
+            token_count=tokens,
             status="Blocked by Cap",
         )
         raise HTTPException(
@@ -360,27 +434,20 @@ def heartbeat(agent_id: str, body: HeartbeatIn):
     db.update_agent(
         agent_id,
         daily_spend=next_spend,
+        monthly_spend=round(float(agent.get("monthly_spend") or 0) + cost, 4),
         last_heartbeat=db.now_iso(),
-        status="running",
+        spend_date=db.chicago_today(),
     )
 
-    if body.current_task_id:
-        ticket = db.get_ticket(body.current_task_id)
-        if ticket:
-            fields = {"tokens_used": ticket["tokens_used"] + body.tokens_consumed}
-            if ticket["status"] in ("backlog", "assigned"):
-                fields["status"] = "in_progress"
-            db.update_ticket(body.current_task_id, **fields)
-
-    remaining = round(agent["daily_cap"] - next_spend, 4)
+    remaining = round(float(agent["daily_cap"]) - next_spend, 4)
     record_trace(
         agent_id=agent["id"],
         agent_name=agent["name"],
         tool_called="heartbeat",
-        prompt=body.note or f"task={body.current_task_id or 'none'}",
-        response=f"CONTINUE remaining=${remaining:.2f}",
-        token_count=body.tokens_consumed,
-        latency_ms=42,
+        prompt=body.note or "dashboard ping",
+        response="PONG remaining=${:.2f}".format(remaining) if ping_only else f"CONTINUE remaining=${remaining:.2f}",
+        token_count=tokens,
+        latency_ms=0,
         status="Success",
     )
     return {
@@ -388,7 +455,9 @@ def heartbeat(agent_id: str, body: HeartbeatIn):
         "agent_id": agent["id"],
         "current_spend": next_spend,
         "remaining_budget": remaining,
-        "state": "running",
+        "state": agent["status"],
+        "cost_incurred": cost,
+        "tokens_consumed": tokens,
     }
 
 
@@ -461,130 +530,63 @@ def nanoclaw_status():
     return {"available": found, "path": path}
 
 
-@app.post("/api/agents/{agent_id}/nanoclaw/run")
+def _enqueue_run(agent_id: str, body: AgentRunIn, kind: Optional[str] = None):
+    agent = db.get_agent(agent_id)
+    if not agent:
+        raise HTTPException(404, "Agent not found")
+    goal = (body.goal or agent.get("goal") or "").strip()
+    cwd = (body.working_dir or agent.get("working_dir") or "").strip()
+    try:
+        job = jobs.enqueue(agent, goal=goal, cwd=cwd, kind=kind, ticket_id=body.ticket_id)
+    except PermissionError as exc:
+        raise HTTPException(403, str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    return {"job_id": job["id"], "status": job["status"]}
+
+
+@app.post("/api/agents/{agent_id}/run", status_code=202)
+def run_agent_job(agent_id: str, body: AgentRunIn):
+    return _enqueue_run(agent_id, body)
+
+
+@app.get("/api/jobs")
+def list_jobs(agent_id: Optional[str] = None):
+    return db.list_jobs(agent_id=agent_id)
+
+
+@app.get("/api/jobs/{job_id}")
+def get_job(job_id: str):
+    job = db.get_job(job_id)
+    if not job:
+        raise HTTPException(404, "Job not found")
+    return job
+
+
+@app.post("/api/jobs/{job_id}/cancel")
+def cancel_job(job_id: str):
+    job = jobs.cancel_job(job_id)
+    if not job:
+        raise HTTPException(404, "Job not found")
+    return job
+
+
+@app.post("/api/agents/{agent_id}/idle")
+def force_idle(agent_id: str):
+    agent = jobs.force_idle(agent_id)
+    if not agent:
+        raise HTTPException(404, "Agent not found")
+    return agent_from_row(agent)
+
+
+@app.post("/api/agents/{agent_id}/nanoclaw/run", status_code=202)
 def run_nanoclaw_agent(agent_id: str, body: NanoclawRunIn):
-    from nanoclaw_runner import run_nanoclaw_chat
-
-    agent = db.get_agent(agent_id)
-    if not agent:
-        raise HTTPException(404, "Agent not found")
-    if agent.get("status") == "paused":
-        raise HTTPException(403, "Agent is paused")
-    if agent["daily_spend"] >= agent["daily_cap"] and agent["daily_cap"] > 0:
-        db.update_agent(agent_id, status="exceeded")
-        raise HTTPException(403, "Daily budget cap reached")
-
-    goal = (body.goal or agent.get("goal") or "").strip()
-    if not goal:
-        raise HTTPException(400, "Nanoclaw agent needs a goal")
-    working_dir = (body.working_dir or agent.get("working_dir") or "").strip() or None
-
-    db.update_agent(agent_id, status="running", last_heartbeat=db.now_iso())
-    result = run_nanoclaw_chat(goal, cwd=working_dir, timeout_sec=body.timeout_sec)
-
-    tokens = int(result.get("token_count") or 0)
-    cost = round(tokens * 0.000002, 6)
-    next_spend = round(float(agent["daily_spend"]) + cost, 4)
-    status = "exceeded" if next_spend >= agent["daily_cap"] and agent["daily_cap"] > 0 else "idle"
-    if not result.get("ok"):
-        status = "paused"
-
-    db.update_agent(
-        agent_id,
-        status=status,
-        daily_spend=next_spend,
-        last_heartbeat=db.now_iso(),
-        total_tokens=int(agent.get("total_tokens") or 0) + tokens,
-        last_run_summary=(result.get("stdout") or result.get("error") or "")[:2000],
-        goal=goal,
-        working_dir=working_dir or "",
-        kind="nanoclaw",
-        provider="nanoclaw",
-        model="nanoclaw",
-    )
-    record_trace(
-        agent_id=agent["id"],
-        agent_name=agent["name"],
-        tool_called="nanoclaw",
-        prompt=goal,
-        response=(result.get("stdout") or result.get("error") or "")[:4000],
-        token_count=tokens,
-        latency_ms=int(result.get("latency_ms") or 0),
-        status="Success" if result.get("ok") else "Error",
-    )
-    return {
-        "ok": result.get("ok"),
-        "agent_id": agent_id,
-        "action": "CONTINUE" if result.get("ok") else "HALT",
-        "stdout": result.get("stdout"),
-        "stderr": result.get("stderr"),
-        "error": result.get("error"),
-        "latency_ms": result.get("latency_ms"),
-        "token_count": tokens,
-        "state": status,
-        "argv": result.get("argv"),
-    }
+    return _enqueue_run(agent_id, AgentRunIn(goal=body.goal, working_dir=body.working_dir), kind="nanoclaw")
 
 
-@app.post("/api/agents/{agent_id}/hermes/run")
+@app.post("/api/agents/{agent_id}/hermes/run", status_code=202)
 def run_hermes_agent(agent_id: str, body: HermesRunIn):
-    from hermes_runner import run_hermes_chat
-
-    agent = db.get_agent(agent_id)
-    if not agent:
-        raise HTTPException(404, "Agent not found")
-    if agent.get("status") == "paused":
-        raise HTTPException(403, "Agent is paused")
-    if agent["daily_spend"] >= agent["daily_cap"] and agent["daily_cap"] > 0:
-        db.update_agent(agent_id, status="exceeded")
-        raise HTTPException(403, "Daily budget cap reached")
-
-    goal = (body.goal or agent.get("goal") or "").strip()
-    if not goal:
-        raise HTTPException(400, "Hermes agent needs a goal")
-    working_dir = (body.working_dir or agent.get("working_dir") or "").strip() or None
-
-    db.update_agent(agent_id, status="running", last_heartbeat=db.now_iso())
-    result = run_hermes_chat(goal, cwd=working_dir, timeout_sec=body.timeout_sec)
-
-    tokens = int(result.get("token_count") or 0)
-    cost = round(tokens * 0.000002, 6)
-    next_spend = round(float(agent["daily_spend"]) + cost, 4)
-    status = "exceeded" if next_spend >= agent["daily_cap"] and agent["daily_cap"] > 0 else "idle"
-    if not result.get("ok"):
-        status = "paused" if agent.get("kind") == "hermes" else "idle"
-
-    db.update_agent(
-        agent_id,
-        status=status,
-        daily_spend=next_spend,
-        last_heartbeat=db.now_iso(),
-        total_tokens=int(agent.get("total_tokens") or 0) + tokens,
-        last_run_summary=(result.get("stdout") or result.get("error") or "")[:2000],
-        goal=goal,
-        working_dir=working_dir or "",
-    )
-    record_trace(
-        agent_id=agent["id"],
-        agent_name=agent["name"],
-        tool_called="hermes_chat",
-        prompt=goal,
-        response=(result.get("stdout") or result.get("error") or "")[:4000],
-        token_count=tokens,
-        latency_ms=int(result.get("latency_ms") or 0),
-        status="Success" if result.get("ok") else "Error",
-    )
-    return {
-        "ok": result.get("ok"),
-        "agent_id": agent_id,
-        "action": "CONTINUE" if result.get("ok") else "HALT",
-        "stdout": result.get("stdout"),
-        "stderr": result.get("stderr"),
-        "error": result.get("error"),
-        "latency_ms": result.get("latency_ms"),
-        "token_count": tokens,
-        "state": status,
-    }
+    return _enqueue_run(agent_id, AgentRunIn(goal=body.goal, working_dir=body.working_dir), kind="hermes")
 
 
 @app.get("/api/openclaw/status")
@@ -604,68 +606,9 @@ def openclaw_chat(body: OpenClawRunIn):
     return run_openclaw_chat(goal, url=body.url or None, timeout_sec=body.timeout_sec)
 
 
-@app.post("/api/agents/{agent_id}/openclaw/run")
+@app.post("/api/agents/{agent_id}/openclaw/run", status_code=202)
 def run_openclaw_agent(agent_id: str, body: OpenClawRunIn):
-    from openclaw_runner import DEFAULT_URL, run_openclaw_chat
-
-    agent = db.get_agent(agent_id)
-    if not agent:
-        raise HTTPException(404, "Agent not found")
-    if agent.get("status") == "paused":
-        raise HTTPException(403, "Agent is paused")
-    if agent["daily_spend"] >= agent["daily_cap"] and agent["daily_cap"] > 0:
-        db.update_agent(agent_id, status="exceeded")
-        raise HTTPException(403, "Daily budget cap reached")
-
-    goal = (body.goal or agent.get("goal") or "").strip()
-    if not goal:
-        raise HTTPException(400, "OpenClaw agent needs a goal")
-
-    db.update_agent(agent_id, status="running", last_heartbeat=db.now_iso())
-    result = run_openclaw_chat(goal, url=body.url or DEFAULT_URL, timeout_sec=body.timeout_sec)
-
-    tokens = int(result.get("token_count") or 0)
-    cost = round(tokens * 0.000002, 6)
-    next_spend = round(float(agent["daily_spend"]) + cost, 4)
-    status = "exceeded" if next_spend >= agent["daily_cap"] and agent["daily_cap"] > 0 else "idle"
-    if not result.get("ok"):
-        status = "paused"
-
-    db.update_agent(
-        agent_id,
-        status=status,
-        daily_spend=next_spend,
-        last_heartbeat=db.now_iso(),
-        total_tokens=int(agent.get("total_tokens") or 0) + tokens,
-        last_run_summary=(result.get("stdout") or result.get("error") or "")[:2000],
-        goal=goal,
-        kind=agent.get("kind") or "openclaw",
-        provider="openclaw",
-        model="openclaw",
-    )
-    record_trace(
-        agent_id=agent["id"],
-        agent_name=agent["name"],
-        tool_called="openclaw_chat",
-        prompt=goal,
-        response=(result.get("stdout") or result.get("error") or "")[:4000],
-        token_count=tokens,
-        latency_ms=int(result.get("latency_ms") or 0),
-        status="Success" if result.get("ok") else "Error",
-    )
-    return {
-        "ok": result.get("ok"),
-        "agent_id": agent_id,
-        "action": "CONTINUE" if result.get("ok") else "HALT",
-        "stdout": result.get("stdout"),
-        "stderr": result.get("stderr"),
-        "error": result.get("error"),
-        "latency_ms": result.get("latency_ms"),
-        "token_count": tokens,
-        "state": status,
-        "url": result.get("url"),
-        "http_status": result.get("http_status"),
-    }
+    return _enqueue_run(agent_id, AgentRunIn(goal=body.goal, url=body.url), kind="openclaw")
 
 
 @app.get("/")

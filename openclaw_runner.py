@@ -45,7 +45,7 @@ def _extract_text(payload: Any) -> str:
         first = choices[0] if isinstance(choices[0], dict) else {}
         return _extract_text(first.get("message") or first.get("text") or first)
 
-    return json.dumps(payload, ensure_ascii=False)[:4000]
+    return ""
 
 
 def _post(url: str, body: dict, timeout_sec: int) -> tuple[int, Any, str]:
@@ -119,70 +119,77 @@ def run_openclaw_chat(
     timeout_sec: int = DEFAULT_TIMEOUT,
     extra: Optional[dict] = None,
 ) -> dict:
-    payloads = [
-        {"message": goal},
-        {"prompt": goal},
-        {"input": goal},
-        {"text": goal},
-        {
-            "model": "openclaw",
-            "messages": [{"role": "user", "content": goal}],
-        },
-    ]
-    if extra:
-        payloads.insert(0, {**extra, "message": extra.get("message", goal)})
+    body = extra if extra and isinstance(extra, dict) else {"message": goal}
+    if "message" not in body:
+        body = {**body, "message": goal}
 
-    last_error = "OpenClaw request failed"
-    last_raw = ""
     started = time.perf_counter()
-    for body in payloads:
-        try:
-            status, parsed, raw = _post(url, body, timeout_sec)
-        except ConnectionError as exc:
-            return {
-                "ok": False,
-                "error": f"Cannot reach OpenClaw at {url}: {exc}",
-                "stdout": "",
-                "stderr": "",
-                "latency_ms": int((time.perf_counter() - started) * 1000),
-                "token_count": 0,
-                "url": url,
-            }
-        last_raw = raw
-        if 200 <= status < 300:
-            text = _extract_text(parsed) or (raw.strip() if isinstance(raw, str) else "")
-            return {
-                "ok": True,
-                "error": None,
-                "stdout": text,
-                "stderr": "",
-                "latency_ms": int((time.perf_counter() - started) * 1000),
-                "token_count": max(1, len(goal.split()) + len(text.split())),
-                "url": url,
-                "request": body,
-                "http_status": status,
-            }
-        if status in (400, 415, 422):
-            last_error = f"HTTP {status}: {raw[:500]}"
-            continue
+    try:
+        status, parsed, raw = _post(url, body, timeout_sec)
+    except ConnectionError as exc:
         return {
             "ok": False,
-            "error": f"HTTP {status}: {raw[:800]}",
+            "error": f"Cannot reach OpenClaw at {url}: {exc}",
             "stdout": "",
-            "stderr": raw[:800],
+            "stderr": "",
             "latency_ms": int((time.perf_counter() - started) * 1000),
-            "token_count": 0,
+            "tokens": None,
+            "token_count": None,
+            "usage_source": "unknown",
+            "url": url,
+        }
+
+    if not (200 <= status < 300):
+        snippet = (raw or "")[:500]
+        return {
+            "ok": False,
+            "error": f"HTTP {status}: {snippet}",
+            "stdout": "",
+            "stderr": snippet,
+            "latency_ms": int((time.perf_counter() - started) * 1000),
+            "tokens": None,
+            "token_count": None,
+            "usage_source": "unknown",
             "url": url,
             "request": body,
             "http_status": status,
         }
 
+    text = _extract_text(parsed)
+    if not text:
+        snippet = (raw or "")[:500]
+        return {
+            "ok": False,
+            "error": f"OpenClaw returned unrecognized JSON: {snippet}",
+            "stdout": "",
+            "stderr": snippet,
+            "latency_ms": int((time.perf_counter() - started) * 1000),
+            "tokens": None,
+            "token_count": None,
+            "usage_source": "unknown",
+            "url": url,
+            "request": body,
+            "http_status": status,
+        }
+
+    usage = None
+    if isinstance(parsed, dict):
+        if isinstance(parsed.get("usage"), dict):
+            usage = parsed["usage"]
+        elif any(key in parsed for key in ("total_tokens", "prompt_tokens", "token_count", "cost")):
+            usage = parsed
+
     return {
-        "ok": False,
-        "error": last_error,
-        "stdout": "",
-        "stderr": last_raw[:800],
+        "ok": True,
+        "error": None,
+        "stdout": text,
+        "stderr": "",
         "latency_ms": int((time.perf_counter() - started) * 1000),
-        "token_count": 0,
+        "tokens": None,
+        "token_count": None,
+        "usage": usage,
+        "usage_source": "unknown",
         "url": url,
+        "request": body,
+        "http_status": status,
     }

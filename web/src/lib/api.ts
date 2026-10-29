@@ -15,6 +15,10 @@ export type Agent = {
   total_tokens?: number;
   last_run_summary?: string;
   avatar_color?: string;
+  monthly_spend?: number;
+  monthly_cap?: number | null;
+  usage_source?: string;
+  spend_date?: string | null;
 };
 
 export type Ticket = {
@@ -46,6 +50,12 @@ export type Trace = {
   token_count: number;
   status: string;
   timestamp: string;
+  job_id?: string | null;
+  job_stdout?: string;
+  job_stderr?: string;
+  job_error?: string | null;
+  job_status?: string | null;
+  job_finished_at?: string | null;
 };
 
 const API_BASE =
@@ -91,6 +101,8 @@ export const api = {
     }),
   createAgent: (body: Record<string, unknown>) =>
     request<Agent>("/api/agents", { method: "POST", body: JSON.stringify(body) }),
+  deleteAgent: (id: string) =>
+    request<{ ok: boolean; deleted: string }>(`/api/agents/${id}`, { method: "DELETE" }),
   runOpenClaw: (id: string, extra?: Record<string, unknown>) =>
     request<any>(`/api/agents/${id}/openclaw/run`, {
       method: "POST",
@@ -99,12 +111,14 @@ export const api = {
   heartbeat: (id: string) =>
     request<any>(`/api/agents/${id}/heartbeat`, {
       method: "POST",
-      body: JSON.stringify({ tokens_consumed: 250, cost_incurred: 0.04, note: "dashboard ping" }),
+      body: JSON.stringify({ ping_only: true, note: "dashboard ping" }),
     }),
   setStatus: (id: string, status: string) =>
     request<Agent>(`/api/agents/${id}/status`, { method: "PATCH", body: JSON.stringify({ status }) }),
   saveCap: (id: string, daily_cap: number) =>
     request<Agent>(`/api/agents/${id}/budget`, { method: "PATCH", body: JSON.stringify({ daily_cap }) }),
+  saveMonthlyCap: (monthly_cap: number) =>
+    request<any>("/api/company", { method: "PATCH", body: JSON.stringify({ monthly_cap }) }),
   saveGoal: (id: string, goal: string, working_dir?: string) =>
     request<Agent>(`/api/agents/${id}/goal`, {
       method: "PATCH",
@@ -115,6 +129,10 @@ export const api = {
       method: "POST",
       body: JSON.stringify(extra || {}),
     }),
+  cancelJob: (jobId: string) =>
+    request<any>(`/api/jobs/${jobId}/cancel`, { method: "POST" }),
+  forceIdle: (id: string) =>
+    request<Agent>(`/api/agents/${id}/idle`, { method: "POST" }),
   createTicket: (body: Record<string, unknown>) =>
     request<Ticket>("/api/tickets", { method: "POST", body: JSON.stringify(body) }),
   advanceTicket: (id: string, status: string) =>

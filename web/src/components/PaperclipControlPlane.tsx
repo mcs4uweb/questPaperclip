@@ -22,6 +22,7 @@ import {
   Eye,
   HardDrive,
   Trash2,
+  Square,
 } from "lucide-react";
 import { Agent, Ticket, Trace, api, boardStatus, LANE_STATUSES, uiStatus } from "@/lib/api";
 
@@ -56,8 +57,10 @@ export default function PaperclipControlPlane() {
   const [nanoclaw, setNanoclaw] = useState<{ available: boolean; path?: string } | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [busyId, setBusyId] = useState<string | null>(null);
+  const [activeJobs, setActiveJobs] = useState<Record<string, string>>({});
 
   const [overallMonthlyCap, setOverallMonthlyCap] = useState(150);
+  const [monthlyCapDirty, setMonthlyCapDirty] = useState(false);
   const [autoPauseOnError, setAutoPauseOnError] = useState(true);
   const [fallbackToLocal, setFallbackToLocal] = useState(true);
   const [traceSearch, setTraceSearch] = useState("");
@@ -102,6 +105,9 @@ export default function PaperclipControlPlane() {
         api.nanoclawStatus(),
       ]);
       setCompany(c);
+      if (!monthlyCapDirty && typeof c?.monthly_cap === "number") {
+        setOverallMonthlyCap(c.monthly_cap);
+      }
       setAgents(a);
       setTickets(t);
       setTraces(tr);
@@ -130,11 +136,13 @@ export default function PaperclipControlPlane() {
 
   const metrics = useMemo(() => {
     const totalDailySpend = agents.reduce((acc, a) => acc + (a.daily_spend || 0), 0);
+    const totalMonthlySpend = company?.monthly_spend ?? agents.reduce((acc, a) => acc + (a.monthly_spend || 0), 0);
     const totalTokens = agents.reduce((acc, a) => acc + (a.total_tokens || 0), 0);
     const activeAgentsCount = agents.filter((a) => a.status === "running").length;
     const activeTasksCount = tickets.filter((t) => !["done", "completed"].includes(t.status)).length;
-    return { totalDailySpend, totalTokens, activeAgentsCount, activeTasksCount };
-  }, [agents, tickets]);
+    const usageSource = company?.usage_source || (agents.some((a) => a.usage_source === "parsed") ? "mixed" : "unknown");
+    return { totalDailySpend, totalMonthlySpend, totalTokens, activeAgentsCount, activeTasksCount, usageSource };
+  }, [agents, tickets, company]);
 
   function draftGoal(agent: Agent) {
     return goalDrafts[agent.id] ?? agent.goal ?? "";
@@ -147,16 +155,22 @@ export default function PaperclipControlPlane() {
     return goal;
   }
 
-  async function runHermes(agent: Agent) {
+  async function queueRun(agent: Agent, kind: "hermes" | "openclaw" | "nanoclaw") {
     setBusyId(agent.id);
     try {
       const goal = await persistGoal(agent);
       if (!goal) {
-        notify("Add a goal in the box on this card, then click Run Hermes.");
+        notify(`Add a goal in the box on this card, then click Run ${kind === "hermes" ? "Hermes" : kind === "openclaw" ? "OpenClaw" : "Nanoclaw"}.`);
         return;
       }
-      const result = await api.runHermes(agent.id, { goal });
-      notify(result.ok ? `Hermes finished for ${agent.name}` : result.error || "Hermes failed");
+      const starter = kind === "nanoclaw" ? api.runNanoclaw : kind === "openclaw" ? api.runOpenClaw : api.runHermes;
+      const result = await starter(agent.id, { goal });
+      if (result.job_id) {
+        setActiveJobs((prev) => ({ ...prev, [agent.id]: result.job_id }));
+        notify(`${kind} queued ${result.job_id}`);
+      } else {
+        notify(result.error || `${kind} did not return a job_id`);
+      }
       await refresh();
     } catch (err: any) {
       notify(err.message);
@@ -164,43 +178,54 @@ export default function PaperclipControlPlane() {
     } finally {
       setBusyId(null);
     }
+  }
+
+  async function runHermes(agent: Agent) {
+    return queueRun(agent, "hermes");
   }
 
   async function runOpenClaw(agent: Agent) {
-    setBusyId(agent.id);
-    try {
-      const goal = await persistGoal(agent);
-      if (!goal) {
-        notify("Add a goal in the box on this card, then click Run OpenClaw.");
-        return;
-      }
-      const result = await api.runOpenClaw(agent.id, { goal });
-      notify(result.ok ? `OpenClaw finished for ${agent.name}` : result.error || "OpenClaw failed");
-      await refresh();
-    } catch (err: any) {
-      notify(err.message);
-      await refresh();
-    } finally {
-      setBusyId(null);
-    }
+    return queueRun(agent, "openclaw");
   }
 
   async function runNanoclaw(agent: Agent) {
-    setBusyId(agent.id);
+    return queueRun(agent, "nanoclaw");
+  }
+
+  async function cancelAgentJob(agent: Agent) {
+    const jobId = activeJobs[agent.id];
     try {
-      const goal = await persistGoal(agent);
-      if (!goal) {
-        notify("Add a goal in the box on this card, then click Run Nanoclaw.");
-        return;
+      if (jobId) {
+        await api.cancelJob(jobId);
+        notify(`Cancelled ${jobId}`);
+      } else {
+        await api.forceIdle(agent.id);
+        notify(`Force idle ${agent.name}`);
       }
-      const result = await api.runNanoclaw(agent.id, { goal });
-      notify(result.ok ? `Nanoclaw finished for ${agent.name}` : result.error || "Nanoclaw failed");
+      setActiveJobs((prev) => {
+        const next = { ...prev };
+        delete next[agent.id];
+        return next;
+      });
       await refresh();
     } catch (err: any) {
       notify(err.message);
       await refresh();
-    } finally {
-      setBusyId(null);
+    }
+  }
+
+  async function forceIdleAgent(agent: Agent) {
+    try {
+      await api.forceIdle(agent.id);
+      setActiveJobs((prev) => {
+        const next = { ...prev };
+        delete next[agent.id];
+        return next;
+      });
+      notify(`${agent.name} is idle`);
+      await refresh();
+    } catch (err: any) {
+      notify(err.message);
     }
   }
 
@@ -248,6 +273,17 @@ export default function PaperclipControlPlane() {
     } catch (err: any) {
       notify(err.message);
       await refresh();
+    }
+  }
+
+  async function removeAgent(agent: Agent) {
+    if (!window.confirm(`Delete agent "${agent.name}"? Traces for this agent are removed.`)) return;
+    try {
+      await api.deleteAgent(agent.id);
+      notify(`Deleted ${agent.name}`);
+      await refresh();
+    } catch (err: any) {
+      notify(err.message);
     }
   }
 
@@ -430,7 +466,17 @@ export default function PaperclipControlPlane() {
                         <h3 className="text-sm font-semibold">{agent.name}</h3>
                         <p className="text-xs text-slate-400">{agent.role}</p>
                       </div>
-                      <span className="px-2 py-0.5 rounded-full text-[10px] border border-slate-700">{label}</span>
+                      <div className="flex items-center space-x-1">
+                        <span className="px-2 py-0.5 rounded-full text-[10px] border border-slate-700">{label}</span>
+                        <button
+                          type="button"
+                          title="Delete agent"
+                          onClick={() => removeAgent(agent)}
+                          className="p-1.5 rounded-lg text-slate-400 hover:text-rose-400 hover:bg-rose-500/10"
+                        >
+                          <Trash2 className="w-3.5 h-3.5" />
+                        </button>
+                      </div>
                     </div>
                     <div className="mt-4 p-2.5 bg-slate-950/60 rounded-xl border border-slate-800/80 text-xs space-y-1.5">
                       <div className="flex justify-between"><span className="text-slate-400">Runtime</span><span className="font-mono">{agent.provider} / {agent.model}</span></div>
@@ -446,7 +492,7 @@ export default function PaperclipControlPlane() {
                       />
                     </div>
                     <div className="mt-4 text-xs flex justify-between">
-                      <span>${agent.daily_spend.toFixed(2)} / ${agent.daily_cap.toFixed(2)}</span>
+                      <span>${agent.daily_spend.toFixed(2)} / ${agent.daily_cap.toFixed(2)} · {agent.usage_source || "unknown"}</span>
                       <span className="text-slate-500 flex items-center space-x-1"><Clock className="w-3 h-3" /><span>{agent.last_heartbeat ? new Date(agent.last_heartbeat).toLocaleTimeString() : "never"}</span></span>
                     </div>
                     <div className="mt-4 flex items-center justify-end space-x-2">
@@ -455,8 +501,19 @@ export default function PaperclipControlPlane() {
                         {agent.status === "paused" ? <Play className="w-3 h-3" /> : <Pause className="w-3 h-3" />}
                         <span>{agent.status === "paused" ? "Resume" : "Pause"}</span>
                       </button>
+                      {(isRunning || agent.status === "paused") && (
+                        <button onClick={() => forceIdleAgent(agent)} className="px-2.5 py-1 rounded-lg text-xs border border-amber-700 text-amber-200">
+                          Force idle
+                        </button>
+                      )}
+                      {isRunning && (
+                        <button onClick={() => cancelAgentJob(agent)} className="px-2.5 py-1 rounded-lg text-xs border border-rose-700 text-rose-200 flex items-center space-x-1">
+                          <Square className="w-3 h-3" />
+                          <span>Cancel</span>
+                        </button>
+                      )}
                       <button onClick={() => runAgent(agent)} disabled={busyId === agent.id} className="px-2.5 py-1 rounded-lg text-xs bg-indigo-600 disabled:opacity-50">
-                        {busyId === agent.id ? "Running…" : runLabel(agent)}
+                        {busyId === agent.id ? "Queued…" : runLabel(agent)}
                       </button>
                     </div>
                   </div>
@@ -561,27 +618,47 @@ export default function PaperclipControlPlane() {
         {activeTab === "budget" && (
           <div className="space-y-6">
             <div className="bg-slate-900 border border-slate-800 rounded-2xl p-6">
-              <div className="flex justify-between">
-                <h2 className="text-base font-semibold">Monthly token spend</h2>
-                <input type="number" value={overallMonthlyCap} onChange={(e) => setOverallMonthlyCap(Number(e.target.value))} className="w-24 bg-slate-950 border border-slate-800 rounded-xl px-2 py-1 text-sm" />
+              <div className="flex justify-between items-center">
+                <div>
+                  <h2 className="text-base font-semibold">Monthly spend (stored cap)</h2>
+                  <p className="text-[11px] text-slate-400 mt-1">
+                    Source: {metrics.usageSource === "parsed" ? "parsed provider usage" : metrics.usageSource === "mixed" ? "parsed + unknown" : "unknown — no invented word counts"}
+                  </p>
+                </div>
+                <input
+                  type="number"
+                  value={overallMonthlyCap}
+                  onChange={(e) => { setMonthlyCapDirty(true); setOverallMonthlyCap(Number(e.target.value)); }}
+                  onBlur={async () => {
+                    await api.saveMonthlyCap(Number(overallMonthlyCap) || 0);
+                    setMonthlyCapDirty(false);
+                    refresh();
+                  }}
+                  className="w-24 bg-slate-950 border border-slate-800 rounded-xl px-2 py-1 text-sm"
+                />
               </div>
-              <div className="mt-6 w-full bg-slate-950 h-3 rounded-full overflow-hidden border border-slate-800">
-                <div className="bg-indigo-500 h-full" style={{ width: `${Math.min(100, (metrics.totalDailySpend * 12.4 / overallMonthlyCap) * 100)}%` }} />
+              <div className="mt-2 text-xs text-slate-300 font-mono">
+                ${metrics.totalMonthlySpend.toFixed(2)} / ${Number(overallMonthlyCap || 0).toFixed(2)}
+              </div>
+              <div className="mt-4 w-full bg-slate-950 h-3 rounded-full overflow-hidden border border-slate-800">
+                <div className="bg-indigo-500 h-full" style={{ width: `${Math.min(100, ((metrics.totalMonthlySpend || 0) / Math.max(overallMonthlyCap || 1, 0.01)) * 100)}%` }} />
               </div>
             </div>
             <div className="bg-slate-900 border border-slate-800 rounded-2xl overflow-hidden">
               <table className="w-full text-left text-xs">
-                <thead className="bg-slate-950 text-slate-400"><tr><th className="p-3">Agent</th><th className="p-3">Tokens</th><th className="p-3">Spend</th><th className="p-3">Cap</th></tr></thead>
+                <thead className="bg-slate-950 text-slate-400"><tr><th className="p-3">Agent</th><th className="p-3">Tokens</th><th className="p-3">Daily</th><th className="p-3">Monthly</th><th className="p-3">Cap</th><th className="p-3">Source</th></tr></thead>
                 <tbody>
                   {agents.map((agent) => (
                     <tr key={agent.id} className="border-t border-slate-800">
                       <td className="p-3">{agent.name}</td>
                       <td className="p-3 font-mono">{(agent.total_tokens || 0).toLocaleString()}</td>
                       <td className="p-3">${agent.daily_spend.toFixed(2)}</td>
+                      <td className="p-3">${(agent.monthly_spend || 0).toFixed(2)}</td>
                       <td className="p-3">
                         <input type="number" defaultValue={agent.daily_cap} className="w-20 bg-slate-950 border border-slate-800 rounded px-2 py-1"
                           onBlur={async (e) => { await api.saveCap(agent.id, Number(e.target.value)); refresh(); }} />
                       </td>
+                      <td className="p-3 font-mono text-slate-400">{agent.usage_source || "unknown"}</td>
                     </tr>
                   ))}
                 </tbody>
@@ -608,7 +685,7 @@ export default function PaperclipControlPlane() {
             </div>
             <div className="bg-slate-900 border border-slate-800 rounded-2xl overflow-hidden">
               <table className="w-full text-left text-xs">
-                <thead className="bg-slate-950 text-slate-400"><tr><th className="p-3">ID</th><th className="p-3">Timestamp</th><th className="p-3">Agent</th><th className="p-3">Tool</th><th className="p-3">Prompt</th><th className="p-3">Status</th><th className="p-3"></th></tr></thead>
+                <thead className="bg-slate-950 text-slate-400"><tr><th className="p-3">ID</th><th className="p-3">Result date</th><th className="p-3">Agent</th><th className="p-3">Tool</th><th className="p-3">Prompt</th><th className="p-3">Status</th><th className="p-3">Job results</th><th className="p-3"></th></tr></thead>
                 <tbody>
                   {filteredTraces.map((trace) => (
                     <tr key={trace.id} className="border-t border-slate-800">
@@ -618,6 +695,15 @@ export default function PaperclipControlPlane() {
                       <td className="p-3 font-mono text-cyan-300">{trace.tool_called}</td>
                       <td className="p-3 truncate max-w-xs">{trace.prompt}</td>
                       <td className="p-3">{trace.status}</td>
+                      <td className="p-3">
+                        <button
+                          type="button"
+                          className="text-indigo-400 hover:text-indigo-300 underline"
+                          onClick={() => setSelectedTrace(trace)}
+                        >
+                          Job results
+                        </button>
+                      </td>
                       <td className="p-3"><button onClick={() => setSelectedTrace(trace)}><Eye className="w-3.5 h-3.5" /></button></td>
                     </tr>
                   ))}
@@ -635,7 +721,7 @@ export default function PaperclipControlPlane() {
               <h3 className="font-bold text-lg">Trace {selectedTrace.id}</h3>
               <button onClick={() => setSelectedTrace(null)}><X className="w-5 h-5" /></button>
             </div>
-            <pre className="text-sm leading-relaxed bg-slate-950 p-4 rounded-xl overflow-auto flex-1 whitespace-pre-wrap">{selectedTrace.response}</pre>
+            <pre className="text-sm leading-relaxed bg-slate-950 p-4 rounded-xl overflow-auto flex-1 whitespace-pre-wrap">{selectedTrace.job_stdout || selectedTrace.response || selectedTrace.job_error || "No job stdout recorded."}</pre>
           </div>
         </div>
       )}

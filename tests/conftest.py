@@ -23,7 +23,7 @@ def client(tmp_path, monkeypatch):
     import runner
     from runner import Result, set_runner_impl
 
-    def fake_run(agent, goal, cwd=None, timeout_sec=None, job_id=None, url=None):
+    def fake_run(agent, goal, cwd=None, timeout_sec=None, job_id=None, url=None, **_kwargs):
         if "SLEEP" in (goal or ""):
             for _ in range(50):
                 if job_id and jobs.is_cancel_requested(job_id):

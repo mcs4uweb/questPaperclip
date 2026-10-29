@@ -3,7 +3,7 @@ id: US-P0.2
 epic: Epic 0 — Stop treating a run as a request
 priority: P0
 sprint: 1
-status: todo
+status: review
 blocked_by:
   - "[[US-P0.1 Jobs table and async run]]"
 tags:
@@ -29,11 +29,11 @@ tags:
 - Create: none unless US-P0.1 already added `jobs.py`
 
 ## Acceptance
-- [ ] `POST /api/jobs/{id}/cancel` marks a queued job cancelled, or a running job cancelled and attempts to stop the child process.
-- [ ] `POST /api/agents/{id}/idle` sets the agent to `idle` and cancels any open job for that agent.
-- [ ] Next UI: Cancel on a running card, and Force idle when status is `running` or `paused`.
-- [ ] A cancelled job writes a trace with status `Cancelled` (not Success).
-- [ ] `docs/SYSTEM.md` drops the "use PowerShell PATCH" workaround as the primary fix.
+- [x] `POST /api/jobs/{id}/cancel` marks a queued job cancelled, or a running job cancelled and attempts to stop the child process.
+- [x] `POST /api/agents/{id}/idle` sets the agent to `idle` and cancels any open job for that agent.
+- [x] Next UI: Cancel on a running card, and Force idle when status is `running` or `paused`.
+- [x] A cancelled job writes a trace with status `Cancelled` (not Success).
+- [x] `docs/SYSTEM.md` drops the "use PowerShell PATCH" workaround as the primary fix.
 
 ## Test
 - Queue a job, cancel while queued → job `cancelled`, agent `idle`.
