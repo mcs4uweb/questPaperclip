@@ -139,6 +139,8 @@ export const api = {
     request<Ticket>(`/api/tickets/${id}/status`, { method: "PUT", body: JSON.stringify({ status }) }),
   deleteTicket: (id: string) =>
     request<{ deleted: string }>(`/api/tickets/${id}`, { method: "DELETE" }),
+  deleteTrace: (id: string) =>
+    request<{ deleted: string }>(`/api/traces/${id}`, { method: "DELETE" }),
 };
 
 export function uiStatus(status?: string) {
