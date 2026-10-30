@@ -115,7 +115,14 @@ def init_db() -> None:
         _migrate_agent_hermes_columns(conn)
         _migrate_agent_usage_columns(conn)
         _migrate_jobs_table(conn)
+        _migrate_trace_job_column(conn)
         _seed_if_empty(conn)
+
+
+def _migrate_trace_job_column(conn: sqlite3.Connection) -> None:
+    existing = {row["name"] for row in conn.execute("PRAGMA table_info(traces)").fetchall()}
+    if "job_id" not in existing:
+        conn.execute("ALTER TABLE traces ADD COLUMN job_id TEXT")
 
 
 def _migrate_agent_hermes_columns(conn: sqlite3.Connection) -> None:
@@ -542,10 +549,53 @@ def add_trace(
     return row_to_dict(row)
 
 
+def delete_trace(trace_id: str) -> bool:
+    with get_conn() as conn:
+        cur = conn.execute("DELETE FROM traces WHERE id = ?", (trace_id,))
+    return cur.rowcount > 0
+
+
 def list_traces(limit: int = 50) -> list[dict[str, Any]]:
     with get_conn() as conn:
         rows = conn.execute(
-            "SELECT * FROM traces ORDER BY timestamp DESC LIMIT ?",
+            """
+            WITH linked AS (
+              SELECT
+                tr.*,
+                COALESCE(
+                  tr.job_id,
+                  -- legacy traces without job_id: match the single closest job by time
+                  (
+                    SELECT c.id FROM (
+                      SELECT j2.id, ABS(
+                        strftime('%s', COALESCE(j2.finished_at, j2.created_at))
+                        - strftime('%s', tr.timestamp)
+                      ) AS gap
+                      FROM jobs j2
+                      WHERE j2.agent_id = tr.agent_id
+                    ) c
+                    WHERE c.gap < 300
+                    ORDER BY c.gap
+                    LIMIT 1
+                  )
+                ) AS linked_job_id
+              FROM traces tr
+            )
+            SELECT
+              t.id, t.agent_id, t.agent_name, t.tool_called, t.prompt,
+              t.latency_ms, t.token_count, t.status, t.timestamp,
+              t.linked_job_id AS job_id,
+              COALESCE(NULLIF(j.stdout, ''), t.response) AS response,
+              COALESCE(j.stdout, '') AS job_stdout,
+              COALESCE(j.stderr, '') AS job_stderr,
+              j.error AS job_error,
+              j.status AS job_status,
+              j.finished_at AS job_finished_at
+            FROM linked t
+            LEFT JOIN jobs j ON j.id = t.linked_job_id
+            ORDER BY t.timestamp DESC
+            LIMIT ?
+            """,
             (limit,),
         ).fetchall()
     return [row_to_dict(r) for r in rows]
