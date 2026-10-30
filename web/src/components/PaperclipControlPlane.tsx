@@ -276,6 +276,25 @@ export default function PaperclipControlPlane() {
     }
   }
 
+  async function removeTrace(trace: Trace) {
+    if (!window.confirm(`Delete trace ${trace.id}?`)) return;
+    try {
+      await api.deleteTrace(trace.id);
+      if (selectedTrace?.id === trace.id) setSelectedTrace(null);
+      notify(`Deleted ${trace.id}`);
+      await refresh();
+    } catch (err: any) {
+      if (err.message === "Trace not found") {
+        // already gone (stale grid) — drop it locally and resync
+        setTraces((prev) => prev.filter((t) => t.id !== trace.id));
+        if (selectedTrace?.id === trace.id) setSelectedTrace(null);
+        await refresh();
+        return;
+      }
+      notify(err.message);
+    }
+  }
+
   async function removeAgent(agent: Agent) {
     if (!window.confirm(`Delete agent "${agent.name}"? Traces for this agent are removed.`)) return;
     try {
@@ -685,10 +704,20 @@ export default function PaperclipControlPlane() {
             </div>
             <div className="bg-slate-900 border border-slate-800 rounded-2xl overflow-hidden">
               <table className="w-full text-left text-xs">
-                <thead className="bg-slate-950 text-slate-400"><tr><th className="p-3">ID</th><th className="p-3">Result date</th><th className="p-3">Agent</th><th className="p-3">Tool</th><th className="p-3">Prompt</th><th className="p-3">Status</th><th className="p-3">Job results</th><th className="p-3"></th></tr></thead>
+                <thead className="bg-slate-950 text-slate-400"><tr><th className="p-3 w-10"></th><th className="p-3">ID</th><th className="p-3">Result date</th><th className="p-3">Agent</th><th className="p-3">Tool</th><th className="p-3">Prompt</th><th className="p-3">Status</th><th className="p-3">Job results</th><th className="p-3"></th></tr></thead>
                 <tbody>
                   {filteredTraces.map((trace) => (
                     <tr key={trace.id} className="border-t border-slate-800">
+                      <td className="p-3">
+                        <button
+                          type="button"
+                          title="Delete trace"
+                          className="text-slate-500 hover:text-rose-400"
+                          onClick={() => removeTrace(trace)}
+                        >
+                          <Trash2 className="w-3.5 h-3.5" />
+                        </button>
+                      </td>
                       <td className="p-3 font-mono text-indigo-400">{trace.id}</td>
                       <td className="p-3 whitespace-nowrap text-slate-300">{trace.timestamp ? new Date(trace.timestamp).toLocaleString() : "—"}</td>
                       <td className="p-3">{trace.agent_name}</td>
@@ -721,7 +750,7 @@ export default function PaperclipControlPlane() {
               <h3 className="font-bold text-lg">Trace {selectedTrace.id}</h3>
               <button onClick={() => setSelectedTrace(null)}><X className="w-5 h-5" /></button>
             </div>
-            <pre className="text-sm leading-relaxed bg-slate-950 p-4 rounded-xl overflow-auto flex-1 whitespace-pre-wrap">{selectedTrace.job_stdout || selectedTrace.response || selectedTrace.job_error || "No job stdout recorded."}</pre>
+            <pre className="text-sm leading-relaxed bg-slate-950 p-4 rounded-xl overflow-auto flex-1 min-h-0 whitespace-pre-wrap">{selectedTrace.job_stdout || selectedTrace.response || selectedTrace.job_error || "No job stdout recorded."}</pre>
           </div>
         </div>
       )}

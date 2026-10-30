@@ -514,6 +514,13 @@ def list_traces(limit: int = 50):
     return [trace_from_row(row) for row in db.list_traces(max(1, min(limit, 200)))]
 
 
+@app.delete("/api/traces/{trace_id}")
+def delete_trace(trace_id: str):
+    if not db.delete_trace(trace_id):
+        raise HTTPException(404, "Trace not found")
+    return {"deleted": trace_id}
+
+
 @app.get("/api/hermes/status")
 def hermes_status():
     from hermes_runner import hermes_available

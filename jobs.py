@@ -273,15 +273,17 @@ def _finish(agent: dict, job: dict, result: Result) -> None:
         usage_source=result.usage_source,
         spend_date=db.chicago_today(),
     )
+    full_out = result.stdout or result.error or ""
     db.add_trace(
         trace_id=f"tr-{uuid4().hex[:6]}",
         agent_id=agent["id"],
         agent_name=agent.get("name") or agent["id"],
         tool_called=job.get("kind") or "run",
         prompt=job.get("goal") or "",
-        response=(result.stdout or result.error or "")[:4000],
+        response=full_out,
         token_count=added_tokens,
         latency_ms=int(result.latency_ms or 0),
         status="Success" if result.ok else "Error",
+        job_id=job_id,
     )
     forget_job(job_id)
