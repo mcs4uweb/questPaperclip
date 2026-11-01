@@ -32,3 +32,6 @@ dist-ssr
 /blob-report/
 /playwright/.cache/
 /playwright/.auth/
+__pycache__
+.pytest_cache
+.next/
