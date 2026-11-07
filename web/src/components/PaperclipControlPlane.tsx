@@ -58,6 +58,8 @@ export default function PaperclipControlPlane() {
   const [error, setError] = useState<string | null>(null);
   const [busyId, setBusyId] = useState<string | null>(null);
   const [activeJobs, setActiveJobs] = useState<Record<string, string>>({});
+  const [jobMeta, setJobMeta] = useState<Record<string, { status: string; finished?: boolean }>>({});
+  const seenFinished = React.useRef<Set<string>>(new Set());
 
   const [overallMonthlyCap, setOverallMonthlyCap] = useState(150);
   const [monthlyCapDirty, setMonthlyCapDirty] = useState(false);
@@ -129,9 +131,54 @@ export default function PaperclipControlPlane() {
     return () => clearInterval(id);
   }, []);
 
-  function notify(message: string) {
+  useEffect(() => {
+    const ids = Object.values(activeJobs);
+    if (ids.length === 0) return undefined;
+    let cancelled = false;
+
+    async function pollJobs() {
+      for (const jobId of ids) {
+        try {
+          const job = await api.getJob(jobId);
+          if (cancelled) return;
+          const status = String(job.status || "");
+          setJobMeta((prev) => ({ ...prev, [jobId]: { status, finished: !["queued", "running"].includes(status) } }));
+          if (["queued", "running"].includes(status)) continue;
+          if (seenFinished.current.has(jobId)) continue;
+          seenFinished.current.add(jobId);
+          const agentName = agents.find((a) => a.id === job.agent_id)?.name || job.agent_id || "agent";
+          if (status === "succeeded") {
+            notify(`${agentName} finished. Open Traces → Job results.`, 8000);
+          } else if (status === "cancelled") {
+            notify(`${agentName} job cancelled.`, 5000);
+          } else {
+            notify(`${agentName} failed: ${job.error || status}`, 8000);
+          }
+          setActiveJobs((prev) => {
+            const next = { ...prev };
+            Object.keys(next).forEach((agentId) => {
+              if (next[agentId] === jobId) delete next[agentId];
+            });
+            return next;
+          });
+          await refresh();
+        } catch {
+          // job may not exist yet
+        }
+      }
+    }
+
+    pollJobs();
+    const id = setInterval(pollJobs, 3000);
+    return () => {
+      cancelled = true;
+      clearInterval(id);
+    };
+  }, [activeJobs, agents]);
+
+  function notify(message: string, ms = 3000) {
     setToast(message);
-    setTimeout(() => setToast(null), 3000);
+    setTimeout(() => setToast(null), ms);
   }
 
   const metrics = useMemo(() => {
@@ -476,7 +523,10 @@ export default function PaperclipControlPlane() {
               {agents.map((agent) => {
                 const label = uiStatus(agent.status);
                 const isOverCap = label === "Exceeded Cap";
-                const isRunning = label === "Running" || busyId === agent.id;
+                const jobId = activeJobs[agent.id];
+                const liveJob = jobId ? jobMeta[jobId] : null;
+                const isRunning = label === "Running" || busyId === agent.id || Boolean(jobId);
+                const jobLabel = liveJob?.status || (jobId ? "queued" : "");
                 return (
                   <div key={agent.id} className="bg-slate-900 border border-slate-800 rounded-2xl p-5 relative overflow-hidden">
                     <div className={`absolute top-0 left-0 right-0 h-1 ${isOverCap ? "bg-rose-500" : isRunning ? "bg-emerald-500" : "bg-slate-600"}`} />
@@ -514,6 +564,11 @@ export default function PaperclipControlPlane() {
                       <span>${agent.daily_spend.toFixed(2)} / ${agent.daily_cap.toFixed(2)} · {agent.usage_source || "unknown"}</span>
                       <span className="text-slate-500 flex items-center space-x-1"><Clock className="w-3 h-3" /><span>{agent.last_heartbeat ? new Date(agent.last_heartbeat).toLocaleTimeString() : "never"}</span></span>
                     </div>
+                    {jobId && (
+                      <div className="mt-2 text-[11px] text-cyan-300 font-mono">
+                        Job {jobId}: {jobLabel}{jobLabel === "running" || jobLabel === "queued" ? " — waiting for finish…" : ""}
+                      </div>
+                    )}
                     <div className="mt-4 flex items-center justify-end space-x-2">
                       <button onClick={() => ping(agent.id)} className="p-1.5 bg-slate-800 rounded-lg" title="Heartbeat only"><RefreshCw className="w-3.5 h-3.5" /></button>
                       <button onClick={() => toggle(agent)} className="px-2.5 py-1 rounded-lg text-xs border border-slate-700 flex items-center space-x-1">

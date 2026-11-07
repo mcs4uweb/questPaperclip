@@ -1,5 +1,5 @@
 # Python
-__pycache__/
+__pycache__/*
 *.py[cod]
 .venv/
 venv/
@@ -21,3 +21,4 @@ web/out/
 .env
 .env.local
 .DS_Store
+
