@@ -129,6 +129,7 @@ export const api = {
       method: "POST",
       body: JSON.stringify(extra || {}),
     }),
+  getJob: (jobId: string) => request<any>(`/api/jobs/${jobId}`),
   cancelJob: (jobId: string) =>
     request<any>(`/api/jobs/${jobId}/cancel`, { method: "POST" }),
   forceIdle: (id: string) =>
