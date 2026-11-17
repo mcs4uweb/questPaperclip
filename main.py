@@ -97,6 +97,9 @@ class TraceLog(BaseModel):
     job_error: Optional[str] = None
     job_status: Optional[str] = None
     job_finished_at: Optional[str] = None
+    job_input_tokens: Optional[int] = None
+    job_output_tokens: Optional[int] = None
+    job_cost: Optional[float] = None
 
 
 class HeartbeatIn(BaseModel):
@@ -161,9 +164,9 @@ class AgentGoalIn(BaseModel):
 class AgentCreate(BaseModel):
     name: str = Field(min_length=1, max_length=80)
     role: str = Field(min_length=1, max_length=200)
-    provider: str = "openclaw"
-    model: str = "openclaw"
-    daily_cap: float = 5.0
+    provider: str = "hermes"
+    model: str = "grok-4-6"
+    daily_cap: float = 500.0
     reports_to: Optional[str] = None
     status: Literal["idle", "running", "paused", "exceeded"] = "idle"
     kind: str = "hermes"
@@ -265,6 +268,9 @@ def trace_from_row(row: dict) -> TraceLog:
         job_error=row.get("job_error"),
         job_status=row.get("job_status"),
         job_finished_at=row.get("job_finished_at"),
+        job_input_tokens=row.get("job_input_tokens"),
+        job_output_tokens=row.get("job_output_tokens"),
+        job_cost=row.get("job_cost"),
     )
 
 
@@ -276,6 +282,7 @@ def record_trace(**kwargs) -> TraceLog:
 @app.on_event("startup")
 def startup() -> None:
     db.init_db()
+    db.fail_orphaned_running_jobs()
     jobs.start_worker()
 
 
@@ -567,7 +574,27 @@ def get_job(job_id: str):
     job = db.get_job(job_id)
     if not job:
         raise HTTPException(404, "Job not found")
+    if job["status"] == "running" and job.get("kind") == "hermes" and job.get("started_at"):
+        _attach_live_usage(job)
     return job
+
+
+def _attach_live_usage(job: dict) -> None:
+    """Running totals read straight from Hermes's state.db (not persisted)."""
+    from hermes_usage import find_usage
+    from pricing import cost_for
+
+    try:
+        started = datetime.fromisoformat(job["started_at"]).timestamp()
+    except ValueError:
+        return
+    usage = find_usage("", started_after=started - 2)
+    if usage:
+        job["input_tokens"] = usage["input_tokens"]
+        job["output_tokens"] = usage["output_tokens"]
+        job["tokens"] = usage["total_tokens"]
+        job["cost"] = cost_for(usage)
+        job["usage_source"] = "live"
 
 
 @app.post("/api/jobs/{job_id}/cancel")
@@ -624,6 +651,54 @@ def dashboard():
     if not index.exists():
         raise HTTPException(404, "Dashboard missing")
     return FileResponse(index)
+
+
+def _static_file(rel: str, media_type: str):
+    path = STATIC_DIR / rel
+    if not path.exists():
+        raise HTTPException(404, f"{rel} missing")
+    return FileResponse(path, media_type=media_type)
+
+
+@app.get("/favicon.svg")
+def favicon_svg():
+    return _static_file("favicon.svg", "image/svg+xml")
+
+
+@app.get("/favicon.ico")
+def favicon_ico():
+    ico = STATIC_DIR / "favicon.ico"
+    if ico.exists():
+        return FileResponse(ico, media_type="image/x-icon")
+    return _static_file("favicon.svg", "image/svg+xml")
+
+
+@app.get("/site.webmanifest")
+def site_manifest():
+    return _static_file("site.webmanifest", "application/manifest+json")
+
+
+@app.get("/browserconfig.xml")
+def browserconfig():
+    return _static_file("browserconfig.xml", "application/xml")
+
+
+@app.get("/icons/{icon_path:path}")
+def static_icon(icon_path: str):
+    if ".." in icon_path or icon_path.startswith("/") or icon_path.startswith("\\"):
+        raise HTTPException(404, "Icon missing")
+    path = STATIC_DIR / "icons" / icon_path
+    if not path.is_file():
+        raise HTTPException(404, "Icon missing")
+    suffix = path.suffix.lower()
+    media = {
+        ".png": "image/png",
+        ".ico": "image/x-icon",
+        ".svg": "image/svg+xml",
+        ".xml": "application/xml",
+        ".webmanifest": "application/manifest+json",
+    }.get(suffix, "application/octet-stream")
+    return FileResponse(path, media_type=media)
 
 
 @app.get("/docs-ui")

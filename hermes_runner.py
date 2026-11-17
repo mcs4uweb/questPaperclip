@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import shutil
 import subprocess
+import threading
 import time
 from typing import Callable, Optional
 
@@ -14,26 +15,45 @@ def hermes_available() -> tuple[bool, Optional[str]]:
     return (bool(path), path)
 
 
-def _drain(proc: subprocess.Popen) -> tuple[str, str]:
-    try:
-        stdout, stderr = proc.communicate(timeout=2)
-    except Exception:
-        stdout = ""
-        stderr = ""
+def _reader(stream, sink: list[str]) -> threading.Thread:
+    """Continuously drain a pipe so a chatty child never blocks on write."""
+
+    def pump() -> None:
         try:
-            proc.kill()
-        except OSError:
+            for chunk in iter(lambda: stream.read(4096), ""):
+                sink.append(chunk)
+        except (OSError, ValueError):
             pass
-    return (stdout or "").strip(), (stderr or "").strip()
+
+    thread = threading.Thread(target=pump, daemon=True)
+    thread.start()
+    return thread
+
+
+def _collect(threads: list[threading.Thread], out: list[str], err: list[str]) -> tuple[str, str]:
+    for thread in threads:
+        thread.join(timeout=2)
+    return "".join(out).strip(), "".join(err).strip()
 
 
 def _stop(proc: subprocess.Popen) -> None:
+    """Kill the process and its children (hermes.EXE spawns python children)."""
+    if os.name == "nt":
+        try:
+            subprocess.run(
+                ["taskkill", "/PID", str(proc.pid), "/T", "/F"],
+                capture_output=True,
+                check=False,
+                timeout=10,
+            )
+        except Exception:
+            pass  # fall through to terminate() below
     try:
         proc.terminate()
     except OSError:
         pass
     try:
-        proc.wait(timeout=1)
+        proc.wait(timeout=3)
     except Exception:
         try:
             proc.kill()
@@ -54,6 +74,7 @@ def run_process(
     try:
         proc = subprocess.Popen(
             args,
+            stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
@@ -81,11 +102,15 @@ def run_process(
         except Exception:
             pass
 
+    out_buf: list[str] = []
+    err_buf: list[str] = []
+    readers = [_reader(proc.stdout, out_buf), _reader(proc.stderr, err_buf)]
+
     deadline = None if timeout_sec is None else time.monotonic() + timeout_sec
     while True:
         if cancel_check and cancel_check():
             _stop(proc)
-            stdout, stderr = _drain(proc)
+            stdout, stderr = _collect(readers, out_buf, err_buf)
             return {
                 "ok": False,
                 "error": "cancelled",
@@ -99,7 +124,7 @@ def run_process(
             }
         code = proc.poll()
         if code is not None:
-            stdout, stderr = _drain(proc)
+            stdout, stderr = _collect(readers, out_buf, err_buf)
             combined = "\n".join(part for part in (stdout, stderr) if part).strip()
             ok = code == 0
             return {
@@ -115,7 +140,7 @@ def run_process(
             }
         if deadline is not None and time.monotonic() >= deadline:
             _stop(proc)
-            stdout, stderr = _drain(proc)
+            stdout, stderr = _collect(readers, out_buf, err_buf)
             return {
                 "ok": False,
                 "error": f"timed out after {timeout_sec}s",
@@ -127,6 +152,24 @@ def run_process(
                 "usage_source": "unknown",
             }
         time.sleep(0.05)
+
+
+def _attach_session_usage(result: dict, launched_at: float) -> None:
+    """Fill real token counts from Hermes's state.db (works for timeouts too)."""
+    from hermes_usage import find_usage
+    from pricing import cost_for
+
+    usage = find_usage(result.get("stdout") or "", started_after=launched_at - 2)
+    if not usage:
+        return
+    result.update(
+        cost=cost_for(usage),
+        tokens=usage["total_tokens"],
+        token_count=usage["total_tokens"],
+        input_tokens=usage["input_tokens"],
+        output_tokens=usage["output_tokens"],
+        usage_source="parsed",
+    )
 
 
 def run_hermes_chat(
@@ -154,6 +197,7 @@ def run_hermes_chat(
     env.setdefault("PYTHONUNBUFFERED", "1")
     env.setdefault("NO_COLOR", "1")
     env.setdefault("TERM", "dumb")
+    launched_at = time.time()
     result = run_process(
         [path, "chat", "-q", goal],
         cwd=workdir,
@@ -162,6 +206,7 @@ def run_hermes_chat(
         pid_callback=pid_callback,
         env=env,
     )
+    _attach_session_usage(result, launched_at)
     if result.get("error") and result["error"].startswith("timed out"):
         result["error"] = f"hermes timed out after {timeout_sec}s"
     elif result.get("error") and result["error"].startswith("exited"):

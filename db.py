@@ -185,6 +185,9 @@ def _migrate_jobs_table(conn: sqlite3.Connection) -> None:
     existing = {row["name"] for row in conn.execute("PRAGMA table_info(jobs)").fetchall()}
     if "usage_source" not in existing:
         conn.execute("ALTER TABLE jobs ADD COLUMN usage_source TEXT NOT NULL DEFAULT 'unknown'")
+    for name in ("input_tokens", "output_tokens"):
+        if name not in existing:
+            conn.execute(f"ALTER TABLE jobs ADD COLUMN {name} INTEGER")
 
 
 def _migrate_ticket_story_columns(conn: sqlite3.Connection) -> None:
@@ -263,7 +266,7 @@ def create_agent(
     role: str,
     provider: str = "hermes",
     model: str = "hermes",
-    daily_cap: float = 5.0,
+    daily_cap: float = 500.0,
     reports_to: Optional[str] = None,
     status: str = "idle",
     kind: str = "hermes",
@@ -590,7 +593,10 @@ def list_traces(limit: int = 50) -> list[dict[str, Any]]:
               COALESCE(j.stderr, '') AS job_stderr,
               j.error AS job_error,
               j.status AS job_status,
-              j.finished_at AS job_finished_at
+              j.finished_at AS job_finished_at,
+              j.input_tokens AS job_input_tokens,
+              j.output_tokens AS job_output_tokens,
+              j.cost AS job_cost
             FROM linked t
             LEFT JOIN jobs j ON j.id = t.linked_job_id
             ORDER BY t.timestamp DESC
@@ -603,16 +609,20 @@ def list_traces(limit: int = 50) -> list[dict[str, Any]]:
 
 def reset_daily_spend_if_needed(agent_id: str, today: Optional[str] = None) -> Optional[dict[str, Any]]:
     today = today or chicago_today()
-    agent = get_agent(agent_id)
-    if not agent:
-        return None
-    spend_date = agent.get("spend_date")
-    if spend_date == today:
-        return agent
-    fields: dict[str, Any] = {"spend_date": today, "daily_spend": 0}
-    if agent.get("status") == "exceeded":
-        fields["status"] = "idle"
-    return update_agent(agent_id, **fields)
+    # Single conditional UPDATE: a read-then-write here raced with concurrent
+    # spend updates and could wipe spend already recorded for today.
+    with get_conn() as conn:
+        conn.execute(
+            """
+            UPDATE agents
+            SET daily_spend = 0,
+                spend_date = ?,
+                status = CASE WHEN status = 'exceeded' THEN 'idle' ELSE status END
+            WHERE id = ? AND (spend_date IS NULL OR spend_date != ?)
+            """,
+            (today, agent_id, today),
+        )
+    return get_agent(agent_id)
 
 
 def reset_all_daily_spend_if_needed(today: Optional[str] = None) -> None:
@@ -704,6 +714,20 @@ def list_open_jobs(agent_id: str) -> list[dict[str, Any]]:
     return [row_to_dict(r) for r in rows]
 
 
+def fail_orphaned_running_jobs() -> int:
+    """Mark jobs left 'running' by a previous process as failed.
+
+    Called at startup: no subprocess survives an API restart, and a stale
+    'running' row blocks claim_next_job for that agent forever.
+    """
+    with get_conn() as conn:
+        cur = conn.execute(
+            "UPDATE jobs SET status = 'failed', error = ?, finished_at = ? WHERE status = 'running'",
+            ("interrupted: API restarted while job was running", now_iso()),
+        )
+        return cur.rowcount
+
+
 def get_running_job(agent_id: str) -> Optional[dict[str, Any]]:
     with get_conn() as conn:
         row = conn.execute(
@@ -737,9 +761,13 @@ def claim_next_job() -> Optional[dict[str, Any]]:
         ).fetchone()
         if not row:
             return None
-        conn.execute(
-            "UPDATE jobs SET status = 'running', started_at = ? WHERE id = ?",
+        # Conditional claim: a job cancelled between the SELECT and here must
+        # stay cancelled rather than be flipped back to running.
+        cur = conn.execute(
+            "UPDATE jobs SET status = 'running', started_at = ? WHERE id = ? AND status = 'queued'",
             (now_iso(), row["id"]),
         )
+        if cur.rowcount == 0:
+            return None
         claimed = conn.execute("SELECT * FROM jobs WHERE id = ?", (row["id"],)).fetchone()
     return row_to_dict(claimed) if claimed else None

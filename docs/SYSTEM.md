@@ -232,10 +232,15 @@ paperclip-app/
   openclaw_runner.py
   nanoclaw_runner.py
   static/index.html       simple UI on :8001
+  static/icons/           classic-UI + Android launcher icons
   web/                    Next.js UI on :3003
+  web/public/             Next favicons / PWA icons
   data/paperclip.db
   docs/SYSTEM.md          this file
+  docs/ICONS.md           why each icon file exists / what to target
   start-paperclip.ps1     logon helper
 ```
+
+Favicon / PWA / Android launcher inventory: `docs/ICONS.md` (US-PC-1.0.1). One P-mark (`web/src/app/icon.svg`); every other file is a size a specific client requires.
 
 Live API list: `http://127.0.0.1:8001/docs`

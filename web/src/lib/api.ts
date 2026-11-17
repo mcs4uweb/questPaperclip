@@ -56,7 +56,29 @@ export type Trace = {
   job_error?: string | null;
   job_status?: string | null;
   job_finished_at?: string | null;
+  job_input_tokens?: number | null;
+  job_output_tokens?: number | null;
+  job_cost?: number | null;
 };
+
+export type TokenCounts = { input?: number | null; output?: number | null; total?: number | null; cost?: number | null };
+
+/** "$0.1159" — 4 decimals under a dollar so small runs aren't shown as $0.00. */
+export function formatUsd(cost?: number | null): string {
+  if (cost == null) return "—";
+  return cost < 1 ? `$${cost.toFixed(4)}` : `$${cost.toFixed(2)}`;
+}
+
+/** "52,147 in · 1,587 out · 53,734 total", or just the total when no split is known. */
+export function formatTokens(t: TokenCounts): string {
+  const fmt = (n?: number | null) => (n ?? 0).toLocaleString();
+  if (t.input != null || t.output != null) {
+    const total = t.total ?? (t.input ?? 0) + (t.output ?? 0);
+    const usd = t.cost != null ? ` · ${formatUsd(t.cost)}` : "";
+    return `${fmt(t.input)} in · ${fmt(t.output)} out · ${fmt(total)} total${usd}`;
+  }
+  return t.total ? `${fmt(t.total)} total` : "—";
+}
 
 const API_BASE =
   process.env.NEXT_PUBLIC_API_BASE ||

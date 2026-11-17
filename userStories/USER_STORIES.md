@@ -67,6 +67,9 @@ Lanes match the Next board:
 - [[US-P2.3 Agent delete and archive]]
 - [[US-P2.4 Auth and working-dir allowlist]]
 
+### Icons
+- [[US-PC-1.0.1 Why so many icons]] — inventory in `docs/ICONS.md` (review)
+
 ## Suggested sprint order
 
 | Sprint | Stories | Why |

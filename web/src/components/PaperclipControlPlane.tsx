@@ -24,7 +24,7 @@ import {
   Trash2,
   Square,
 } from "lucide-react";
-import { Agent, Ticket, Trace, api, boardStatus, LANE_STATUSES, uiStatus } from "@/lib/api";
+import { Agent, Ticket, TokenCounts, Trace, api, boardStatus, formatTokens, formatUsd, LANE_STATUSES, uiStatus } from "@/lib/api";
 
 const COLUMNS = ["Backlog", "Assigned", "In Progress", "Review Required", "Completed"];
 
@@ -58,7 +58,7 @@ export default function PaperclipControlPlane() {
   const [error, setError] = useState<string | null>(null);
   const [busyId, setBusyId] = useState<string | null>(null);
   const [activeJobs, setActiveJobs] = useState<Record<string, string>>({});
-  const [jobMeta, setJobMeta] = useState<Record<string, { status: string; finished?: boolean }>>({});
+  const [jobMeta, setJobMeta] = useState<Record<string, { status: string; finished?: boolean; tokens?: TokenCounts }>>({});
   const seenFinished = React.useRef<Set<string>>(new Set());
 
   const [overallMonthlyCap, setOverallMonthlyCap] = useState(150);
@@ -72,6 +72,7 @@ export default function PaperclipControlPlane() {
   const [isNewAgentOpen, setIsNewAgentOpen] = useState(false);
   const [toast, setToast] = useState<string | null>(null);
   const [goalDrafts, setGoalDrafts] = useState<Record<string, string>>({});
+  const [workingDirDrafts, setWorkingDirDrafts] = useState<Record<string, string>>({});
 
   const [newTicket, setNewTicket] = useState({
     title: "",
@@ -91,8 +92,9 @@ export default function PaperclipControlPlane() {
     role: "",
     goal: "",
     working_dir: "C:\\Projects",
-    daily_cap: 5,
+    daily_cap: 500,
     reports_to: "",
+    kind: "hermes",
   });
 
   async function refresh() {
@@ -142,13 +144,15 @@ export default function PaperclipControlPlane() {
           const job = await api.getJob(jobId);
           if (cancelled) return;
           const status = String(job.status || "");
-          setJobMeta((prev) => ({ ...prev, [jobId]: { status, finished: !["queued", "running"].includes(status) } }));
+          const tokens: TokenCounts = { input: job.input_tokens, output: job.output_tokens, total: job.tokens, cost: job.cost };
+          setJobMeta((prev) => ({ ...prev, [jobId]: { status, finished: !["queued", "running"].includes(status), tokens } }));
           if (["queued", "running"].includes(status)) continue;
           if (seenFinished.current.has(jobId)) continue;
           seenFinished.current.add(jobId);
           const agentName = agents.find((a) => a.id === job.agent_id)?.name || job.agent_id || "agent";
           if (status === "succeeded") {
-            notify(`${agentName} finished. Open Traces → Job results.`, 8000);
+            const used = job.tokens != null ? ` (${formatTokens(tokens)})` : "";
+            notify(`${agentName} finished${used}. Open Traces → Job results.`, 8000);
           } else if (status === "cancelled") {
             notify(`${agentName} job cancelled.`, 5000);
           } else {
@@ -195,10 +199,17 @@ export default function PaperclipControlPlane() {
     return goalDrafts[agent.id] ?? agent.goal ?? "";
   }
 
+  function draftWorkingDir(agent: Agent) {
+    return workingDirDrafts[agent.id] ?? agent.working_dir ?? "";
+  }
+
   async function persistGoal(agent: Agent) {
     const goal = draftGoal(agent).trim();
-    await api.saveGoal(agent.id, goal, agent.working_dir || "");
+    const workingDir = draftWorkingDir(agent).trim();
+    await api.saveGoal(agent.id, goal, workingDir);
     setGoalDrafts((prev) => ({ ...prev, [agent.id]: goal }));
+    setWorkingDirDrafts((prev) => ({ ...prev, [agent.id]: workingDir }));
+    setAgents((prev) => prev.map((a) => (a.id === agent.id ? { ...a, goal, working_dir: workingDir } : a)));
     return goal;
   }
 
@@ -211,7 +222,7 @@ export default function PaperclipControlPlane() {
         return;
       }
       const starter = kind === "nanoclaw" ? api.runNanoclaw : kind === "openclaw" ? api.runOpenClaw : api.runHermes;
-      const result = await starter(agent.id, { goal });
+      const result = await starter(agent.id, { goal, working_dir: draftWorkingDir(agent).trim() });
       if (result.job_id) {
         setActiveJobs((prev) => ({ ...prev, [agent.id]: result.job_id }));
         notify(`${kind} queued ${result.job_id}`);
@@ -364,9 +375,9 @@ export default function PaperclipControlPlane() {
       const agent = await api.createAgent({
         name: newAgent.name,
         role: newAgent.role,
-        provider: "openclaw",
-        model: "openclaw",
-        kind: "openclaw",
+        provider: newAgent.kind,
+        model: newAgent.kind === "hermes" ? "grok-4-6" : newAgent.kind,
+        kind: newAgent.kind,
         goal: newAgent.goal,
         working_dir: newAgent.working_dir,
         daily_cap: Number(newAgent.daily_cap),
@@ -374,7 +385,7 @@ export default function PaperclipControlPlane() {
         status: "idle",
       });
       setIsNewAgentOpen(false);
-      setNewAgent({ name: "", role: "", goal: "", working_dir: "C:\\Projects", daily_cap: 5, reports_to: "" });
+      setNewAgent({ name: "", role: "", goal: "", working_dir: "C:\\Projects", daily_cap: 500, reports_to: "", kind: "hermes" });
       notify(`Imported OpenClaw agent ${agent.name}`);
       await refresh();
     } catch (err: any) {
@@ -409,7 +420,13 @@ export default function PaperclipControlPlane() {
   }
 
   const filteredTraces = traces.filter((t) =>
-    [t.agent_name, t.tool_called, t.prompt, t.status].join(" ").toLowerCase().includes(traceSearch.toLowerCase())
+    [
+      t.agent_name,
+      t.tool_called,
+      t.prompt,
+      t.status,
+      t.timestamp ? new Date(t.timestamp).toLocaleDateString() : "",
+    ].join(" ").toLowerCase().includes(traceSearch.toLowerCase())
   );
 
   return (
@@ -550,6 +567,17 @@ export default function PaperclipControlPlane() {
                     <div className="mt-4 p-2.5 bg-slate-950/60 rounded-xl border border-slate-800/80 text-xs space-y-1.5">
                       <div className="flex justify-between"><span className="text-slate-400">Runtime</span><span className="font-mono">{agent.provider} / {agent.model}</span></div>
                       <div className="flex justify-between"><span className="text-slate-400">Kind</span><span>{agent.kind || "hermes"}</span></div>
+                      <div className="flex items-center space-x-1.5 text-slate-400">
+                        <HardDrive className="w-3 h-3 text-cyan-400 shrink-0" />
+                        <span>Working directory</span>
+                      </div>
+                      <input
+                        className="w-full bg-slate-950 border border-slate-800 rounded-lg px-2 py-1.5 text-slate-200 font-mono text-[11px]"
+                        placeholder="C:\Projects\..."
+                        value={draftWorkingDir(agent)}
+                        onChange={(e) => setWorkingDirDrafts((prev) => ({ ...prev, [agent.id]: e.target.value }))}
+                        onBlur={() => persistGoal(agent).catch((err) => notify(err.message))}
+                      />
                       <div className="text-slate-400">Goal (required to run)</div>
                       <textarea
                         rows={4}
@@ -567,6 +595,9 @@ export default function PaperclipControlPlane() {
                     {jobId && (
                       <div className="mt-2 text-[11px] text-cyan-300 font-mono">
                         Job {jobId}: {jobLabel}{jobLabel === "running" || jobLabel === "queued" ? " — waiting for finish…" : ""}
+                        {liveJob?.tokens?.total != null && (
+                          <div className="text-emerald-300">Tokens: {formatTokens(liveJob.tokens)}</div>
+                        )}
                       </div>
                     )}
                     <div className="mt-4 flex items-center justify-end space-x-2">
@@ -759,7 +790,7 @@ export default function PaperclipControlPlane() {
             </div>
             <div className="bg-slate-900 border border-slate-800 rounded-2xl overflow-hidden">
               <table className="w-full text-left text-xs">
-                <thead className="bg-slate-950 text-slate-400"><tr><th className="p-3 w-10"></th><th className="p-3">ID</th><th className="p-3">Result date</th><th className="p-3">Agent</th><th className="p-3">Tool</th><th className="p-3">Prompt</th><th className="p-3">Status</th><th className="p-3">Job results</th><th className="p-3"></th></tr></thead>
+                <thead className="bg-slate-950 text-slate-400"><tr><th className="p-3 w-10"></th><th className="p-3">ID</th><th className="p-3">Date</th><th className="p-3">Time</th><th className="p-3">Agent</th><th className="p-3">Tool</th><th className="p-3">Prompt</th><th className="p-3">Status</th><th className="p-3">Tokens</th><th className="p-3">Cost</th><th className="p-3">Job results</th><th className="p-3"></th></tr></thead>
                 <tbody>
                   {filteredTraces.map((trace) => (
                     <tr key={trace.id} className="border-t border-slate-800">
@@ -774,11 +805,16 @@ export default function PaperclipControlPlane() {
                         </button>
                       </td>
                       <td className="p-3 font-mono text-indigo-400">{trace.id}</td>
-                      <td className="p-3 whitespace-nowrap text-slate-300">{trace.timestamp ? new Date(trace.timestamp).toLocaleString() : "—"}</td>
+                      <td className="p-3 whitespace-nowrap text-slate-300">{trace.timestamp ? new Date(trace.timestamp).toLocaleDateString() : "—"}</td>
+                      <td className="p-3 whitespace-nowrap text-slate-300">{trace.timestamp ? new Date(trace.timestamp).toLocaleTimeString() : "—"}</td>
                       <td className="p-3">{trace.agent_name}</td>
                       <td className="p-3 font-mono text-cyan-300">{trace.tool_called}</td>
                       <td className="p-3 truncate max-w-xs">{trace.prompt}</td>
                       <td className="p-3">{trace.status}</td>
+                      <td className="p-3 font-mono whitespace-nowrap text-slate-300">
+                        {formatTokens({ input: trace.job_input_tokens, output: trace.job_output_tokens, total: trace.token_count })}
+                      </td>
+                      <td className="p-3 font-mono whitespace-nowrap text-emerald-300">{formatUsd(trace.job_cost)}</td>
                       <td className="p-3">
                         <button
                           type="button"
@@ -802,7 +838,12 @@ export default function PaperclipControlPlane() {
         <div className="fixed inset-0 bg-black/70 z-50 flex items-center justify-center p-4">
           <div className="bg-slate-900 border border-slate-800 rounded-2xl max-w-6xl w-full h-[85vh] p-6 space-y-3 flex flex-col">
             <div className="flex justify-between items-center shrink-0">
-              <h3 className="font-bold text-lg">Trace {selectedTrace.id}</h3>
+              <div>
+                <h3 className="font-bold text-lg">Trace {selectedTrace.id}</h3>
+                <p className="text-xs font-mono text-slate-400">
+                  Tokens: {formatTokens({ input: selectedTrace.job_input_tokens, output: selectedTrace.job_output_tokens, total: selectedTrace.token_count, cost: selectedTrace.job_cost })}
+                </p>
+              </div>
               <button onClick={() => setSelectedTrace(null)}><X className="w-5 h-5" /></button>
             </div>
             <pre className="text-sm leading-relaxed bg-slate-950 p-4 rounded-xl overflow-auto flex-1 min-h-0 whitespace-pre-wrap">{selectedTrace.job_stdout || selectedTrace.response || selectedTrace.job_error || "No job stdout recorded."}</pre>
@@ -818,6 +859,18 @@ export default function PaperclipControlPlane() {
             <input required placeholder="Role" className="w-full bg-slate-950 border border-slate-800 rounded-xl px-3 py-2" value={newAgent.role} onChange={(e) => setNewAgent({ ...newAgent, role: e.target.value })} />
             <textarea required rows={4} placeholder="Default OpenClaw goal (POST http://127.0.0.1:18789/chat/main)" className="w-full bg-slate-950 border border-slate-800 rounded-xl px-3 py-2" value={newAgent.goal} onChange={(e) => setNewAgent({ ...newAgent, goal: e.target.value })} />
             <input placeholder="Working directory" className="w-full bg-slate-950 border border-slate-800 rounded-xl px-3 py-2" value={newAgent.working_dir} onChange={(e) => setNewAgent({ ...newAgent, working_dir: e.target.value })} />
+            <label className="block text-xs text-slate-400">
+              Kind
+              <select
+                className="mt-1 w-full bg-slate-950 border border-slate-800 rounded-xl px-3 py-2 text-slate-200"
+                value={newAgent.kind}
+                onChange={(e) => setNewAgent({ ...newAgent, kind: e.target.value })}
+              >
+                <option value="hermes">Hermes</option>
+                <option value="openclaw">OpenClaw</option>
+                <option value="nanoclaw">Nanoclaw</option>
+              </select>
+            </label>
             <div className="flex justify-end space-x-2">
               <button type="button" onClick={() => setIsNewAgentOpen(false)} className="px-3 py-2 bg-slate-800 rounded-xl">Cancel</button>
               <button className="px-3 py-2 bg-indigo-600 rounded-xl">Save agent</button>

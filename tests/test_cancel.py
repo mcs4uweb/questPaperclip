@@ -1,3 +1,5 @@
+import io
+
 from tests.conftest import make_agent, wait_job
 
 
@@ -15,8 +17,8 @@ def test_hermes_runner_honors_cancel_and_reports_pid():
             started.append(kwargs)
             self.pid = 4242
             self.returncode = None
-            self.stdout = type("Out", (), {"read": lambda self: ""})()
-            self.stderr = type("Err", (), {"read": lambda self: ""})()
+            self.stdout = io.StringIO("")
+            self.stderr = io.StringIO("")
 
         def poll(self):
             return None

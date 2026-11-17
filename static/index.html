@@ -4,6 +4,16 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Quest Paperclip</title>
+  <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
+  <link rel="icon" href="/favicon.ico" sizes="48x48" />
+  <link rel="icon" href="/icons/favicon-16x16.png" type="image/png" sizes="16x16" />
+  <link rel="icon" href="/icons/favicon-32x32.png" type="image/png" sizes="32x32" />
+  <link rel="icon" href="/icons/favicon-48x48.png" type="image/png" sizes="48x48" />
+  <link rel="apple-touch-icon" href="/icons/apple-touch-icon.png" sizes="180x180" />
+  <link rel="manifest" href="/site.webmanifest" />
+  <meta name="theme-color" content="#4338ca" />
+  <meta name="msapplication-TileColor" content="#4338ca" />
+  <meta name="msapplication-config" content="/browserconfig.xml" />
   <style>
     :root {
       --bg: #0b1220;
@@ -272,8 +282,9 @@
       </table></div>`;
 
       sections.traces.innerHTML = `<div class="panel"><table>
-        <tr><th>Time</th><th>Agent</th><th>Tool</th><th>Prompt</th><th>Status</th></tr>
+        <tr><th>Date</th><th>Time</th><th>Agent</th><th>Tool</th><th>Prompt</th><th>Status</th></tr>
         ${traces.map(t => `<tr>
+          <td class="muted">${new Date(t.timestamp).toLocaleDateString()}</td>
           <td class="muted">${new Date(t.timestamp).toLocaleTimeString()}</td>
           <td>${t.agent_name}</td>
           <td>${t.tool_called}</td>

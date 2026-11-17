@@ -84,3 +84,20 @@ def make_agent(client, **overrides) -> dict:
     res = client.post("/api/agents", json=body)
     assert res.status_code == 200, res.text
     return res.json()
+
+
+@pytest.fixture(autouse=True)
+def _isolate_hermes_state_db(tmp_path, monkeypatch):
+    """Never let tests read the developer's real Hermes state.db."""
+    import hermes_usage
+
+    monkeypatch.setattr(hermes_usage, "STATE_DB", str(tmp_path / "no-hermes-state.db"))
+
+
+@pytest.fixture(autouse=True)
+def _isolate_litellm_pricing(monkeypatch):
+    """Never let tests call the developer's real LiteLLM proxy."""
+    import pricing
+
+    pricing._cache.clear()
+    monkeypatch.setattr(pricing, "_fetch_model_info", lambda: None)

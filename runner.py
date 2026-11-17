@@ -20,6 +20,8 @@ class Result:
     stderr: str = ""
     error: Optional[str] = None
     tokens: Optional[int] = None
+    input_tokens: Optional[int] = None
+    output_tokens: Optional[int] = None
     cost: Optional[float] = None
     latency_ms: int = 0
     model: Optional[str] = None
@@ -125,6 +127,8 @@ def _from_raw(raw: dict, model: str) -> Result:
     provider_usage = raw.get("usage") or raw.get("provider_usage")
     if raw.get("usage_source") == "parsed" and (raw.get("tokens") is not None or raw.get("cost") is not None):
         result.tokens = raw.get("tokens")
+        result.input_tokens = raw.get("input_tokens")
+        result.output_tokens = raw.get("output_tokens")
         result.cost = raw.get("cost")
         result.usage_source = "parsed"
         return result

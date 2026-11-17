@@ -1,3 +1,4 @@
+import io
 from usage import parse_usage
 
 
@@ -58,6 +59,10 @@ def test_hermes_runner_does_not_invent_word_counts(monkeypatch):
     class FakeProc:
         pid = 99
         returncode = 0
+
+        def __init__(self):
+            self.stdout = io.StringIO("The agent finished the task and wrote three files.")
+            self.stderr = io.StringIO("")
 
         def poll(self):
             return 0

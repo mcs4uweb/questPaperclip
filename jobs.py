@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import threading
 import time
 from typing import Optional
@@ -12,6 +13,9 @@ from runner import Result, is_runnable_kind, run_agent
 
 JOB_STATUSES = ("queued", "running", "succeeded", "failed", "cancelled")
 OPEN_STATUSES = ("queued", "running")
+
+# Hard ceiling per job so a hung model call can't block an agent's queue forever.
+JOB_TIMEOUT_SEC = int(os.environ.get("PAPERCLIP_JOB_TIMEOUT_SEC", "1800"))
 
 _cancel_requested: set[str] = set()
 _job_pids: dict[str, int] = {}
@@ -145,12 +149,15 @@ def force_idle(agent_id: str) -> Optional[dict]:
             request_cancel(job["id"])
             db.update_job(job["id"], status="cancelled", finished_at=db.now_iso(), error="cancelled")
             _write_cancelled_trace(db.get_job(job["id"]))
-    forget_open = db.list_jobs(agent_id=agent_id)
-    for job in forget_open:
+    for job in db.list_jobs(agent_id=agent_id):
         if job["status"] in OPEN_STATUSES:
             db.update_job(job["id"], status="cancelled", finished_at=db.now_iso(), error="cancelled")
             _write_cancelled_trace(db.get_job(job["id"]))
-        forget_job(job["id"])
+        # Keep the cancel flag for a job the worker is still executing: clearing
+        # it here let the runner miss the cancel and finish as "succeeded".
+        # The worker forgets the job itself once the run actually stops.
+        if not _is_executing(job["id"]):
+            forget_job(job["id"])
     return db.update_agent(agent_id, status="idle")
 
 
@@ -179,15 +186,35 @@ def _write_cancelled_trace(job: Optional[dict]) -> None:
     )
 
 
+_executing: set[str] = set()
+
+
+def _is_executing(job_id: str) -> bool:
+    with _lock:
+        return job_id in _executing
+
+
 def _execute(job: dict) -> None:
+    with _lock:
+        _executing.add(job["id"])
+    try:
+        _execute_inner(job)
+    finally:
+        with _lock:
+            _executing.discard(job["id"])
+
+
+def _execute_inner(job: dict) -> None:
     job_id = job["id"]
     agent = db.get_agent(job["agent_id"])
     if not agent:
         db.update_job(job_id, status="failed", error="Agent not found", finished_at=db.now_iso())
         return
-    if is_cancel_requested(job_id):
-        db.update_job(job_id, status="cancelled", error="cancelled", finished_at=db.now_iso())
-        _write_cancelled_trace(db.get_job(job_id))
+    cancelled_in_db = (db.get_job(job_id) or {}).get("status") == "cancelled"
+    if is_cancel_requested(job_id) or cancelled_in_db:
+        if not cancelled_in_db:
+            db.update_job(job_id, status="cancelled", error="cancelled", finished_at=db.now_iso())
+            _write_cancelled_trace(db.get_job(job_id))
         forget_job(job_id)
         _maybe_idle_agent(agent["id"])
         return
@@ -196,7 +223,7 @@ def _execute(job: dict) -> None:
     agent = db.get_agent(agent["id"]) or agent
     db.update_agent(agent["id"], status="running", last_heartbeat=db.now_iso())
     started = db.now_iso()
-    db.update_job(job_id, status="running", started_at=started)
+    db.update_job(job_id, started_at=started)
 
     def pid_callback(pid: int) -> None:
         remember_pid(job_id, pid)
@@ -205,12 +232,14 @@ def _execute(job: dict) -> None:
         agent,
         job["goal"],
         cwd=job.get("cwd") or None,
+        timeout_sec=JOB_TIMEOUT_SEC,
         job_id=job_id,
         cancel_check=lambda: is_cancel_requested(job_id),
         pid_callback=pid_callback,
     )
 
-    if is_cancel_requested(job_id):
+    already_cancelled = (db.get_job(job_id) or {}).get("status") == "cancelled"
+    if is_cancel_requested(job_id) or already_cancelled:
         db.update_job(
             job_id,
             status="cancelled",
@@ -218,12 +247,15 @@ def _execute(job: dict) -> None:
             stderr=result.stderr or "",
             error="cancelled",
             tokens=result.tokens,
+            input_tokens=result.input_tokens,
+            output_tokens=result.output_tokens,
             cost=result.cost,
             latency_ms=result.latency_ms,
             usage_source=result.usage_source,
             finished_at=db.now_iso(),
         )
-        _write_cancelled_trace(db.get_job(job_id))
+        if not already_cancelled:  # force_idle already wrote the trace
+            _write_cancelled_trace(db.get_job(job_id))
         forget_job(job_id)
         _maybe_idle_agent(agent["id"])
         return
@@ -255,7 +287,9 @@ def _finish(agent: dict, job: dict, result: Result) -> None:
         stderr=result.stderr or "",
         error=None if result.ok else (result.error or "failed"),
         tokens=tokens,
-        cost=cost if result.usage_source == "parsed" else None,
+        input_tokens=result.input_tokens if result.usage_source == "parsed" else None,
+        output_tokens=result.output_tokens if result.usage_source == "parsed" else None,
+        cost=result.cost if result.usage_source == "parsed" else None,
         latency_ms=result.latency_ms,
         usage_source=result.usage_source,
         finished_at=db.now_iso(),
