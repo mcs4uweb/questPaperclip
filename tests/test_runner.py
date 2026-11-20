@@ -25,14 +25,13 @@ def test_result_empty_stdout_is_not_invented_success_text():
     assert mapped["stdout"] == ""
 
 
-def test_openclaw_unknown_json_is_readable_error(monkeypatch):
-    from openclaw_runner import run_openclaw_chat
+def test_openclaw_unparseable_output_is_readable_error(monkeypatch):
+    import openclaw_runner
 
-    def fake_post(url, body, timeout_sec):
-        return 200, {"weird": True, "nested": {"x": 1}}, '{"weird": true}'
-
-    monkeypatch.setattr("openclaw_runner._post", fake_post)
-    out = run_openclaw_chat("hello")
+    monkeypatch.setattr(openclaw_runner, "openclaw_available", lambda: (True, "openclaw"))
+    monkeypatch.setattr(openclaw_runner, "run_process", lambda *a, **k: {
+        "ok": False, "error": "exited 1", "stdout": "", "stderr": "Gateway not reachable", "latency_ms": 5})
+    out = openclaw_runner.run_openclaw_chat("hello")
     assert out["ok"] is False
-    assert "HTTP" in out["error"] or "unrecognized" in out["error"].lower()
+    assert "Gateway not reachable" in out["error"]
     assert out.get("stdout") in (None, "")

@@ -523,7 +523,7 @@ export default function PaperclipControlPlane() {
         </div>
       )}
 
-      <main className="flex-1 max-w-7xl w-full mx-auto px-4 sm:px-6 lg:px-8 py-6">
+      <main className={`flex-1 ${activeTab === "traces" ? "max-w-none" : "max-w-7xl"} w-full mx-auto px-4 sm:px-6 lg:px-8 py-6`}>
         {activeTab === "agents" && (
           <div className="space-y-6">
             <div className="flex items-center justify-between bg-slate-900 border border-slate-800 p-4 rounded-2xl">
@@ -788,28 +788,38 @@ export default function PaperclipControlPlane() {
               <Search className="w-4 h-4 absolute left-3 top-3 text-slate-500" />
               <input value={traceSearch} onChange={(e) => setTraceSearch(e.target.value)} placeholder="Search Hermes traces" className="w-full bg-slate-950 border border-slate-800 rounded-xl pl-9 pr-4 py-2 text-xs" />
             </div>
-            <div className="bg-slate-900 border border-slate-800 rounded-2xl overflow-hidden">
+            <div className="bg-slate-900 border border-slate-800 rounded-2xl overflow-x-auto">
               <table className="w-full text-left text-xs">
-                <thead className="bg-slate-950 text-slate-400"><tr><th className="p-3 w-10"></th><th className="p-3">ID</th><th className="p-3">Date</th><th className="p-3">Time</th><th className="p-3">Agent</th><th className="p-3">Tool</th><th className="p-3">Prompt</th><th className="p-3">Status</th><th className="p-3">Tokens</th><th className="p-3">Cost</th><th className="p-3">Job results</th><th className="p-3"></th></tr></thead>
+                <thead className="bg-slate-950 text-slate-400"><tr><th className="p-3 w-16"></th><th className="p-3">ID</th><th className="p-3">Date</th><th className="p-3">Time</th><th className="p-3">Agent</th><th className="p-3">Tool</th><th className="p-3">Prompt</th><th className="p-3">Status</th><th className="p-3">Tokens</th><th className="p-3">Cost</th><th className="p-3">Job results</th></tr></thead>
                 <tbody>
                   {filteredTraces.map((trace) => (
                     <tr key={trace.id} className="border-t border-slate-800">
                       <td className="p-3">
-                        <button
-                          type="button"
-                          title="Delete trace"
-                          className="text-slate-500 hover:text-rose-400"
-                          onClick={() => removeTrace(trace)}
-                        >
-                          <Trash2 className="w-3.5 h-3.5" />
-                        </button>
+                        <div className="flex items-center gap-2">
+                          <button
+                            type="button"
+                            title="View job details"
+                            className="text-slate-400 hover:text-indigo-300"
+                            onClick={() => setSelectedTrace(trace)}
+                          >
+                            <Eye className="w-3.5 h-3.5" />
+                          </button>
+                          <button
+                            type="button"
+                            title="Delete trace"
+                            className="text-slate-500 hover:text-rose-400"
+                            onClick={() => removeTrace(trace)}
+                          >
+                            <Trash2 className="w-3.5 h-3.5" />
+                          </button>
+                        </div>
                       </td>
                       <td className="p-3 font-mono text-indigo-400">{trace.id}</td>
                       <td className="p-3 whitespace-nowrap text-slate-300">{trace.timestamp ? new Date(trace.timestamp).toLocaleDateString() : "—"}</td>
                       <td className="p-3 whitespace-nowrap text-slate-300">{trace.timestamp ? new Date(trace.timestamp).toLocaleTimeString() : "—"}</td>
                       <td className="p-3">{trace.agent_name}</td>
                       <td className="p-3 font-mono text-cyan-300">{trace.tool_called}</td>
-                      <td className="p-3 truncate max-w-xs">{trace.prompt}</td>
+                      <td className="p-3"><div className="truncate max-w-[16rem] 2xl:max-w-md" title={trace.prompt}>{trace.prompt}</div></td>
                       <td className="p-3">{trace.status}</td>
                       <td className="p-3 font-mono whitespace-nowrap text-slate-300">
                         {formatTokens({ input: trace.job_input_tokens, output: trace.job_output_tokens, total: trace.token_count })}
@@ -824,7 +834,6 @@ export default function PaperclipControlPlane() {
                           Job results
                         </button>
                       </td>
-                      <td className="p-3"><button onClick={() => setSelectedTrace(trace)}><Eye className="w-3.5 h-3.5" /></button></td>
                     </tr>
                   ))}
                 </tbody>

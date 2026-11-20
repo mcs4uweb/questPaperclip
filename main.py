@@ -637,7 +637,7 @@ def openclaw_chat(body: OpenClawRunIn):
     goal = (body.goal or "").strip()
     if not goal:
         raise HTTPException(400, "OpenClaw needs a goal")
-    return run_openclaw_chat(goal, url=body.url or None, timeout_sec=body.timeout_sec)
+    return run_openclaw_chat(goal, timeout_sec=body.timeout_sec)
 
 
 @app.post("/api/agents/{agent_id}/openclaw/run", status_code=202)

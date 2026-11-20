@@ -88,19 +88,36 @@ def test_hermes_runner_does_not_invent_word_counts(monkeypatch):
 
 
 def test_openclaw_persists_provider_usage(monkeypatch):
-    from openclaw_runner import run_openclaw_chat
+    import json
 
-    payload = {
-        "output": "ok",
-        "usage": {"total_tokens": 88, "cost": 0.015},
+    import openclaw_runner
+    from runner import _from_raw
+
+    agent_json = {
+        "status": "ok", "summary": "completed",
+        "result": {
+            "payloads": [{"text": "PONG"}],
+            "meta": {"agentMeta": {
+                "sessionId": "paperclip-job-1", "model": "grok-4-6",
+                "usage": {"input": 24653, "output": 3, "total": 24656, "cost": {"total": 0.019732}},
+            }},
+        },
     }
+    seen = {}
 
-    def fake_post(url, body, timeout_sec):
-        assert body == {"message": "hello"}
-        return 200, payload, '{"output":"ok"}'
+    def fake_run_process(args, **kwargs):
+        seen["args"] = args
+        msg_file = args[args.index("--message-file") + 1]
+        seen["message"] = open(msg_file, encoding="utf-8").read()
+        return {"ok": True, "error": None, "stdout": json.dumps(agent_json), "stderr": "", "latency_ms": 9}
 
-    monkeypatch.setattr("openclaw_runner._post", fake_post)
-    out = run_openclaw_chat("hello")
-    assert out["ok"] is True
-    assert out.get("usage") == {"total_tokens": 88, "cost": 0.015}
-    assert out.get("token_count") in (None, 0)
+    monkeypatch.setattr(openclaw_runner, "openclaw_available", lambda: (True, "openclaw"))
+    monkeypatch.setattr(openclaw_runner, "run_process", fake_run_process)
+    raw = openclaw_runner.run_openclaw_chat("hello & <world> 100%", job_id="job-1")
+
+    assert seen["message"] == "hello & <world> 100%"  # passed via file, not argv
+    assert seen["args"][seen["args"].index("--session-id") + 1] == "paperclip-job-1"
+    result = _from_raw(raw, model="openclaw")
+    assert result.ok and result.stdout == "PONG"
+    assert (result.input_tokens, result.output_tokens, result.tokens) == (24653, 3, 24656)
+    assert result.cost == 0.019732 and result.usage_source == "parsed"

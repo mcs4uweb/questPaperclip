@@ -1,195 +1,173 @@
-"""Call a local OpenClaw chat proxy (default http://127.0.0.1:18789/chat/main)."""
+"""Run OpenClaw agent turns through the local OpenClaw Gateway.
+
+Uses the OpenClaw CLI (`openclaw agent --message-file ... --json`), which routes
+the turn through the running Gateway (ws://127.0.0.1:18789). The Gateway has no
+HTTP chat endpoint, so the old POST /chat/main approach always returned 404.
+
+Each paperclip job gets its own OpenClaw session (paperclip-<job id>) so a run
+doesn't drag the whole history of the user's main session into every prompt.
+Token usage and the provider-billed cost come from OpenClaw's JSON result.
+"""
 
 from __future__ import annotations
 
 import json
 import os
+import shutil
+import tempfile
 import time
 import urllib.error
 import urllib.request
-from typing import Any, Optional
+from typing import Any, Callable, Optional
+from uuid import uuid4
 
-DEFAULT_URL = os.environ.get("OPENCLAW_URL", "http://127.0.0.1:18789/chat/main")
-DEFAULT_TIMEOUT = int(os.environ.get("OPENCLAW_TIMEOUT", "90"))
+from hermes_runner import run_process
 
-
-def _extract_text(payload: Any) -> str:
-    if payload is None:
-        return ""
-    if isinstance(payload, str):
-        return payload.strip()
-    if isinstance(payload, list):
-        return "\n".join(part for part in (_extract_text(item) for item in payload) if part)
-    if not isinstance(payload, dict):
-        return str(payload)
-
-    for key in ("output", "response", "text", "content", "message", "reply", "result", "completion"):
-        if key in payload and payload[key] not in (None, ""):
-            value = payload[key]
-            if key == "message" and isinstance(value, dict):
-                return _extract_text(value.get("content") or value.get("text") or value)
-            if key == "content" and isinstance(value, list):
-                chunks = []
-                for item in value:
-                    if isinstance(item, dict):
-                        chunks.append(str(item.get("text") or item.get("content") or ""))
-                    else:
-                        chunks.append(str(item))
-                return "\n".join(chunk for chunk in chunks if chunk).strip()
-            if isinstance(value, (dict, list)):
-                return _extract_text(value)
-            return str(value).strip()
-
-    choices = payload.get("choices")
-    if isinstance(choices, list) and choices:
-        first = choices[0] if isinstance(choices[0], dict) else {}
-        return _extract_text(first.get("message") or first.get("text") or first)
-
-    return ""
+GATEWAY_URL = os.environ.get("OPENCLAW_URL", "http://127.0.0.1:18789/")
+DEFAULT_URL = GATEWAY_URL  # kept for callers that still import DEFAULT_URL
+OPENCLAW_AGENT = os.environ.get("OPENCLAW_AGENT", "main")
+DEFAULT_TIMEOUT = int(os.environ.get("OPENCLAW_TIMEOUT", "1800"))
 
 
-def _post(url: str, body: dict, timeout_sec: int) -> tuple[int, Any, str]:
-    raw = json.dumps(body).encode("utf-8")
-    req = urllib.request.Request(
-        url,
-        data=raw,
-        method="POST",
-        headers={
-            "Content-Type": "application/json",
-            "Accept": "application/json, text/plain;q=0.9,*/*;q=0.8",
-        },
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=timeout_sec) as resp:
-            text = resp.read().decode("utf-8", errors="replace")
-            status = getattr(resp, "status", 200)
-    except urllib.error.HTTPError as exc:
-        text = exc.read().decode("utf-8", errors="replace")
-        return exc.code, _maybe_json(text), text
-    except urllib.error.URLError as exc:
-        raise ConnectionError(str(exc.reason or exc)) from exc
-
-    return status, _maybe_json(text), text
+def openclaw_available() -> tuple[bool, Optional[str]]:
+    path = shutil.which("openclaw")
+    return (bool(path), path)
 
 
-def _maybe_json(text: str) -> Any:
-    try:
-        return json.loads(text) if text else {}
-    except json.JSONDecodeError:
-        return text
-
-
-def openclaw_status(url: str = DEFAULT_URL, timeout_sec: int = 5) -> dict:
+def openclaw_status(url: str = GATEWAY_URL, timeout_sec: int = 5) -> dict:
+    """Probe the Gateway's HTTP root (the dashboard); 200 means it is serving."""
     started = time.perf_counter()
     try:
-        req = urllib.request.Request(url, method="GET", headers={"Accept": "application/json, text/plain"})
-        with urllib.request.urlopen(req, timeout=timeout_sec) as resp:
-            body = resp.read().decode("utf-8", errors="replace")
+        with urllib.request.urlopen(url, timeout=timeout_sec) as resp:
             return {
                 "available": True,
                 "url": url,
-                "method": "GET",
                 "http_status": getattr(resp, "status", 200),
-                "body": body[:1000],
                 "latency_ms": int((time.perf_counter() - started) * 1000),
             }
     except urllib.error.HTTPError as exc:
-        body = exc.read().decode("utf-8", errors="replace")
         return {
-            "available": exc.code < 500,
+            "available": False,
             "url": url,
-            "method": "GET",
             "http_status": exc.code,
-            "body": body[:1000],
+            "error": f"Gateway answered HTTP {exc.code}",
             "latency_ms": int((time.perf_counter() - started) * 1000),
-            "note": "Proxy responded. POST /chat/main to send a message.",
         }
     except Exception as exc:
         return {
             "available": False,
             "url": url,
-            "error": str(exc),
+            "error": f"Gateway not reachable: {exc}. Start it with `oc` or `openclaw gateway status`.",
             "latency_ms": int((time.perf_counter() - started) * 1000),
         }
+
+
+def _fail(error: str, started: float, stdout: str = "", stderr: str = "") -> dict:
+    return {
+        "ok": False,
+        "error": error,
+        "stdout": stdout,
+        "stderr": stderr,
+        "latency_ms": int((time.perf_counter() - started) * 1000),
+        "tokens": None,
+        "token_count": None,
+        "usage_source": "unknown",
+    }
+
+
+def parse_agent_json(text: str) -> dict:
+    """Map `openclaw agent --json` output to paperclip's raw result fields."""
+    data: Any = json.loads(text)
+    result = data.get("result") or {}
+    replies = [p.get("text") for p in (result.get("payloads") or []) if isinstance(p, dict) and p.get("text")]
+    meta = (result.get("meta") or {}).get("agentMeta") or {}
+    usage = meta.get("usage") or {}
+    out: dict = {
+        "ok": data.get("status") == "ok",
+        "stdout": "\n\n".join(replies).strip(),
+        "error": None if data.get("status") == "ok" else (data.get("summary") or data.get("status") or "failed"),
+        "session_id": meta.get("sessionId"),
+        "model": meta.get("model"),
+    }
+    if usage:
+        inp, outp = int(usage.get("input") or 0), int(usage.get("output") or 0)
+        cost = (usage.get("cost") or {}).get("total")
+        out.update(
+            tokens=int(usage.get("total") or inp + outp),
+            token_count=int(usage.get("total") or inp + outp),
+            input_tokens=inp,
+            output_tokens=outp,
+            cost=float(cost) if cost is not None else None,
+            usage_source="parsed",
+        )
+    return out
 
 
 def run_openclaw_chat(
     goal: str,
-    url: str = DEFAULT_URL,
-    timeout_sec: int = DEFAULT_TIMEOUT,
-    extra: Optional[dict] = None,
+    url: Optional[str] = None,  # unused; accepted for backward compatibility
+    timeout_sec: Optional[int] = None,
+    extra: Optional[dict] = None,  # unused; accepted for backward compatibility
+    *,
+    job_id: Optional[str] = None,
+    cwd: Optional[str] = None,
+    cancel_check: Optional[Callable[[], bool]] = None,
+    pid_callback: Optional[Callable[[int], None]] = None,
 ) -> dict:
-    body = extra if extra and isinstance(extra, dict) else {"message": goal}
-    if "message" not in body:
-        body = {**body, "message": goal}
-
     started = time.perf_counter()
+    found, path = openclaw_available()
+    if not found:
+        return _fail("openclaw CLI not found on PATH. Install OpenClaw and confirm `openclaw` works in a terminal.", started)
+
+    timeout = int(timeout_sec or DEFAULT_TIMEOUT)
+    session_id = f"paperclip-{job_id or uuid4().hex[:10]}"
+
+    # --message-file: `openclaw` is a .cmd shim, and cmd.exe mangles long or
+    # special-character (& | % ^) arguments.
+    fd, msg_path = tempfile.mkstemp(prefix="paperclip-openclaw-", suffix=".txt")
     try:
-        status, parsed, raw = _post(url, body, timeout_sec)
-    except ConnectionError as exc:
-        return {
-            "ok": False,
-            "error": f"Cannot reach OpenClaw at {url}: {exc}",
-            "stdout": "",
-            "stderr": "",
-            "latency_ms": int((time.perf_counter() - started) * 1000),
-            "tokens": None,
-            "token_count": None,
-            "usage_source": "unknown",
-            "url": url,
-        }
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(goal)
+        args = [
+            path, "agent",
+            "--agent", OPENCLAW_AGENT,
+            "--session-id", session_id,
+            "--message-file", msg_path,
+            "--timeout", str(timeout),
+            "--json",
+        ]
+        env = os.environ.copy()
+        env.setdefault("NO_COLOR", "1")
+        raw = run_process(
+            args,
+            cwd=cwd if cwd and os.path.isdir(cwd) else None,
+            timeout_sec=timeout + 60,  # let OpenClaw's own --timeout fire first
+            cancel_check=cancel_check,
+            pid_callback=pid_callback,
+            env=env,
+        )
+    finally:
+        try:
+            os.remove(msg_path)
+        except OSError:
+            pass
 
-    if not (200 <= status < 300):
-        snippet = (raw or "")[:500]
-        return {
-            "ok": False,
-            "error": f"HTTP {status}: {snippet}",
-            "stdout": "",
-            "stderr": snippet,
-            "latency_ms": int((time.perf_counter() - started) * 1000),
-            "tokens": None,
-            "token_count": None,
-            "usage_source": "unknown",
-            "url": url,
-            "request": body,
-            "http_status": status,
-        }
+    if raw.get("error") == "cancelled" or (raw.get("error") or "").startswith("timed out"):
+        return {**raw, "error": f"openclaw {raw['error']}" if raw["error"] != "cancelled" else "cancelled"}
 
-    text = _extract_text(parsed)
-    if not text:
-        snippet = (raw or "")[:500]
-        return {
-            "ok": False,
-            "error": f"OpenClaw returned unrecognized JSON: {snippet}",
-            "stdout": "",
-            "stderr": snippet,
-            "latency_ms": int((time.perf_counter() - started) * 1000),
-            "tokens": None,
-            "token_count": None,
-            "usage_source": "unknown",
-            "url": url,
-            "request": body,
-            "http_status": status,
-        }
+    stdout = raw.get("stdout") or ""
+    stderr = raw.get("stderr") or ""
+    try:
+        parsed = parse_agent_json(stdout)
+    except (ValueError, AttributeError):
+        detail = (stderr or stdout or raw.get("error") or "no output")[-800:]
+        return _fail(f"OpenClaw run failed: {detail}", started, stdout=stdout, stderr=stderr)
 
-    usage = None
-    if isinstance(parsed, dict):
-        if isinstance(parsed.get("usage"), dict):
-            usage = parsed["usage"]
-        elif any(key in parsed for key in ("total_tokens", "prompt_tokens", "token_count", "cost")):
-            usage = parsed
-
-    return {
-        "ok": True,
-        "error": None,
-        "stdout": text,
-        "stderr": "",
-        "latency_ms": int((time.perf_counter() - started) * 1000),
-        "tokens": None,
-        "token_count": None,
-        "usage": usage,
-        "usage_source": "unknown",
-        "url": url,
-        "request": body,
-        "http_status": status,
-    }
+    if parsed["ok"] and not parsed["stdout"]:
+        parsed["ok"] = False
+        parsed["error"] = "OpenClaw finished but returned no reply text"
+    parsed.update(stderr=stderr, latency_ms=raw.get("latency_ms") or int((time.perf_counter() - started) * 1000))
+    parsed.setdefault("tokens", None)
+    parsed.setdefault("token_count", None)
+    parsed.setdefault("usage_source", "unknown")
+    return parsed

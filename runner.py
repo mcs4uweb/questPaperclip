@@ -96,14 +96,17 @@ def run_agent(
         )
         return _from_raw(raw, model=agent.get("model") or "nanoclaw")
     if kind == "openclaw":
-        from openclaw_runner import DEFAULT_URL, run_openclaw_chat
+        from openclaw_runner import run_openclaw_chat
 
         raw = run_openclaw_chat(
             goal,
-            url=url or DEFAULT_URL,
-            timeout_sec=timeout_sec or 90,
+            timeout_sec=timeout_sec,
+            job_id=job_id,
+            cwd=cwd,
+            cancel_check=cancel_check,
+            pid_callback=pid_callback,
         )
-        return _from_raw(raw, model=agent.get("model") or "openclaw")
+        return _from_raw(raw, model=raw.get("model") or agent.get("model") or "openclaw")
 
     return Result(
         ok=False,
